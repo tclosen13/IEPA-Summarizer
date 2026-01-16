@@ -1,6 +1,6 @@
 /**
- * IEPA Document Explorer Scraper v10
- * DocuWare Knockout.js menu-based download
+ * IEPA Document Explorer Scraper v11
+ * Network interception to capture PDF
  */
 
 import { chromium, Browser, Page, BrowserContext } from 'playwright';
@@ -218,129 +218,105 @@ export class IEPAScraper {
       const viewerPage = pages[pages.length - 1];
       console.log(`Viewer URL: ${viewerPage.url()}`);
 
-      // Wait for viewer to fully load
-      console.log('Waiting for viewer...');
-      await viewerPage.waitForTimeout(10000);
-
-      // Find and log all buttons/clickable elements
-      const buttons = await viewerPage.evaluate(() => {
-        const result: any[] = [];
-        document.querySelectorAll('button, a, [role="button"], [data-bind]').forEach((el, i) => {
-          const text = el.textContent?.trim().substring(0, 50);
-          const dataBind = el.getAttribute('data-bind');
-          const className = el.className;
-          const title = el.getAttribute('title');
-          
-          if (dataBind?.includes('ownload') || text?.toLowerCase().includes('download') || 
-              className?.toLowerCase().includes('download') || title?.toLowerCase().includes('download')) {
-            result.push({
-              index: i,
-              tag: el.tagName,
-              text,
-              dataBind: dataBind?.substring(0, 100),
-              class: className?.substring(0, 50),
-              title
-            });
-          }
-        });
-        return result;
-      });
+      // Set up request interception to capture PDF
+      let pdfBuffer: Buffer | null = null;
+      let pdfUrl: string = '';
       
-      console.log('Download-related elements:', JSON.stringify(buttons, null, 2));
-
-      // Try clicking elements with download data-bind
-      for (const btn of buttons) {
-        try {
-          console.log(`Trying element: ${btn.tag} - ${btn.text || btn.title || btn.class}`);
+      viewerPage.on('response', async (response) => {
+        const url = response.url();
+        const contentType = response.headers()['content-type'] || '';
+        
+        if (contentType.includes('pdf') || url.includes('.pdf') || url.includes('GetPdf') || url.includes('Download')) {
+          console.log(`Intercepted potential PDF: ${url.substring(0, 100)}`);
+          console.log(`Content-Type: ${contentType}`);
           
-          // Find the element
-          let element = null;
-          if (btn.dataBind) {
-            element = await viewerPage.$(`[data-bind*="Download"]`);
-          }
-          if (!element && btn.title) {
-            element = await viewerPage.$(`[title="${btn.title}"]`);
-          }
-          if (!element && btn.class) {
-            element = await viewerPage.$(`.${btn.class.split(' ')[0]}`);
-          }
-          
-          if (element) {
-            // Click to open dropdown menu
-            console.log('Clicking download button...');
-            await element.click();
-            await viewerPage.waitForTimeout(2000);
-            
-            // Look for dropdown menu items
-            const menuItems = await viewerPage.evaluate(() => {
-              const items: any[] = [];
-              // Look for visible menu items
-              document.querySelectorAll('[class*="menu"] li, [class*="dropdown"] li, [class*="Menu"] a, ul li a, [role="menuitem"]').forEach((item, i) => {
-                const text = item.textContent?.trim();
-                const style = window.getComputedStyle(item);
-                if (style.display !== 'none' && style.visibility !== 'hidden') {
-                  items.push({ index: i, text });
-                }
-              });
-              return items;
-            });
-            
-            console.log('Menu items found:', JSON.stringify(menuItems));
-            
-            // Find "PDF without annotations" or similar
-            for (const item of menuItems) {
-              if (item.text && (
-                item.text.toLowerCase().includes('pdf') || 
-                item.text.toLowerCase().includes('download') ||
-                item.text.toLowerCase().includes('without')
-              )) {
-                console.log(`Clicking menu item: ${item.text}`);
-                
-                // Click the menu item
-                const menuItem = await viewerPage.$(`text=${item.text}`);
-                if (menuItem) {
-                  const downloadPromise = viewerPage.waitForEvent('download', { timeout: 30000 });
-                  await menuItem.click();
-                  
-                  try {
-                    const download = await downloadPromise;
-                    console.log(`Download started: ${download.suggestedFilename()}`);
-                    const path = await download.path();
-                    if (path) {
-                      const fs = require('fs');
-                      const buffer = fs.readFileSync(path);
-                      if (buffer.length > 1000 && buffer[0] === 0x25) {
-                        console.log('SUCCESS!');
-                        await viewerPage.close();
-                        return {
-                          ...doc,
-                          pdfBuffer: buffer,
-                          filename: download.suggestedFilename() || `doc_${doc.date}.pdf`,
-                        };
-                      }
-                    }
-                  } catch (e) {
-                    console.log('Menu item download failed');
-                  }
-                }
-              }
+          try {
+            const buffer = await response.body();
+            if (buffer.length > 1000 && buffer[0] === 0x25) {
+              console.log(`Got PDF! ${buffer.length} bytes`);
+              pdfBuffer = buffer;
+              pdfUrl = url;
             }
+          } catch (e) {
+            // Response body may not be available
+          }
+        }
+      });
+
+      // Wait for viewer to load
+      console.log('Waiting for viewer to load...');
+      await viewerPage.waitForTimeout(8000);
+
+      // If we already captured a PDF from network, return it
+      if (pdfBuffer) {
+        console.log('SUCCESS - captured PDF from network!');
+        await viewerPage.close();
+        return {
+          ...doc,
+          pdfBuffer: pdfBuffer,
+          filename: `doc_${doc.date.replace(/\//g, '-')}.pdf`,
+        };
+      }
+
+      // Find the download button and click it
+      console.log('Looking for download button...');
+      
+      // DocuWare uses specific class names
+      const downloadBtnSelectors = [
+        '[data-bind*="Download"]',
+        '[class*="ico-download"]',
+        '[class*="download"]',
+        '[title*="ownload"]',
+        'button:has-text("Download")',
+      ];
+
+      for (const selector of downloadBtnSelectors) {
+        const btn = await viewerPage.$(selector);
+        if (btn) {
+          console.log(`Found button with selector: ${selector}`);
+          
+          // Click to open menu
+          await btn.click();
+          await viewerPage.waitForTimeout(1500);
+          
+          // Now look for menu items containing "PDF"
+          const menuItems = await viewerPage.$$('li, [role="menuitem"], [class*="menu"] a, .ui-menu-item');
+          console.log(`Found ${menuItems.length} menu items`);
+          
+          for (const item of menuItems) {
+            const text = await item.textContent();
+            console.log(`Menu item: ${text?.substring(0, 50)}`);
             
-            // If no menu appeared, try clicking any visible download option
-            const pdfOption = await viewerPage.$('text=/PDF|Download/i');
-            if (pdfOption) {
-              console.log('Found PDF/Download text, clicking...');
-              const downloadPromise = viewerPage.waitForEvent('download', { timeout: 30000 });
-              await pdfOption.click();
+            if (text && (text.toLowerCase().includes('pdf') || text.toLowerCase().includes('without'))) {
+              console.log(`Clicking: ${text}`);
               
-              try {
-                const download = await downloadPromise;
+              // Set up download listener before clicking
+              const downloadPromise = viewerPage.waitForEvent('download', { timeout: 15000 }).catch(() => null);
+              
+              await item.click();
+              await viewerPage.waitForTimeout(3000);
+              
+              // Check if we captured PDF from network
+              if (pdfBuffer) {
+                console.log('SUCCESS - captured PDF after menu click!');
+                await viewerPage.close();
+                return {
+                  ...doc,
+                  pdfBuffer: pdfBuffer,
+                  filename: `doc_${doc.date.replace(/\//g, '-')}.pdf`,
+                };
+              }
+              
+              // Check for download event
+              const download = await downloadPromise;
+              if (download) {
+                console.log(`Download event: ${download.suggestedFilename()}`);
                 const path = await download.path();
                 if (path) {
                   const fs = require('fs');
                   const buffer = fs.readFileSync(path);
                   if (buffer.length > 1000 && buffer[0] === 0x25) {
-                    console.log('SUCCESS via PDF option!');
+                    console.log('SUCCESS via download event!');
                     await viewerPage.close();
                     return {
                       ...doc,
@@ -349,65 +325,33 @@ export class IEPAScraper {
                     };
                   }
                 }
-              } catch (e) {
-                console.log('PDF option failed');
               }
+              
+              break; // Only try one PDF menu item
             }
           }
-        } catch (e) {
-          console.log('Button click failed:', e);
+          
+          // Press Escape to close menu if it didn't work
+          await viewerPage.keyboard.press('Escape');
+          await viewerPage.waitForTimeout(500);
         }
       }
 
-      // Method: Try right-click on document
-      console.log('Trying right-click context menu...');
+      // Try print to PDF as last resort
+      console.log('Trying print...');
       try {
-        const canvas = await viewerPage.$('canvas');
-        if (canvas) {
-          await canvas.click({ button: 'right' });
-          await viewerPage.waitForTimeout(1500);
-          
-          // Look for context menu
-          const contextItems = await viewerPage.evaluate(() => {
-            const items: string[] = [];
-            document.querySelectorAll('[class*="context"] li, [class*="menu"] li').forEach(item => {
-              const text = item.textContent?.trim();
-              if (text) items.push(text);
-            });
-            return items;
-          });
-          
-          console.log('Context menu items:', contextItems);
-          
-          // Click on PDF download option
-          const pdfItem = await viewerPage.$('text=/Download.*PDF|PDF.*without/i');
-          if (pdfItem) {
-            const downloadPromise = viewerPage.waitForEvent('download', { timeout: 30000 });
-            await pdfItem.click();
-            
-            try {
-              const download = await downloadPromise;
-              const path = await download.path();
-              if (path) {
-                const fs = require('fs');
-                const buffer = fs.readFileSync(path);
-                if (buffer.length > 1000 && buffer[0] === 0x25) {
-                  console.log('SUCCESS via context menu!');
-                  await viewerPage.close();
-                  return {
-                    ...doc,
-                    pdfBuffer: buffer,
-                    filename: download.suggestedFilename() || `doc_${doc.date}.pdf`,
-                  };
-                }
-              }
-            } catch (e) {
-              console.log('Context menu download failed');
-            }
-          }
+        const pdfData = await viewerPage.pdf({ format: 'A4' });
+        if (pdfData.length > 1000) {
+          console.log('SUCCESS via print to PDF!');
+          await viewerPage.close();
+          return {
+            ...doc,
+            pdfBuffer: Buffer.from(pdfData),
+            filename: `doc_${doc.date.replace(/\//g, '-')}.pdf`,
+          };
         }
       } catch (e) {
-        console.log('Right-click failed:', e);
+        console.log('Print to PDF failed (expected in non-headless)');
       }
 
       await viewerPage.close();
