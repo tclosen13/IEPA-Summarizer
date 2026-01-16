@@ -1,6 +1,6 @@
 /**
- * IEPA Document Explorer Scraper v7
- * SlickGrid support for DocuWare
+ * IEPA Document Explorer Scraper v8
+ * Fixed CSS selector for SlickGrid
  */
 
 import { chromium, Browser, Page, BrowserContext } from 'playwright';
@@ -134,41 +134,39 @@ export class IEPAScraper {
     console.log('Waiting for DocuWare SlickGrid to load...');
     await this.page.waitForTimeout(8000);
 
-    // Wait for SlickGrid to render
-    try {
-      await this.page.waitForSelector('.grid-canvas, .slick-row, [class*="slick"]', { timeout: 10000 });
-      console.log('SlickGrid detected');
-    } catch (e) {
-      console.log('SlickGrid not found, trying alternatives...');
-    }
-
     // Extract documents from SlickGrid
     const documents = await this.page.evaluate(() => {
       const docs: any[] = [];
       
       // SlickGrid stores rows in .grid-canvas as direct children divs
-      // Each row has class like "slick-row" or just child divs of grid-canvas
-      const gridCanvas = document.querySelector('.grid-canvas, [class*="grid-canvas"]');
+      const gridCanvas = document.querySelector('.grid-canvas');
       
       if (gridCanvas) {
-        console.log(`Found grid-canvas with ${gridCanvas.children.length} children`);
+        console.log('Found grid-canvas with ' + gridCanvas.children.length + ' children');
         
         // Each child of grid-canvas is a row
-        Array.from(gridCanvas.children).forEach((row, idx) => {
-          // Each row contains cells with class like "slick-cell" or just divs
-          const cells = row.querySelectorAll('.slick-cell, [class*="slick-cell"], > div');
-          const cellTexts = Array.from(cells).map(c => c.textContent?.trim() || '');
+        const children = gridCanvas.children;
+        for (let idx = 0; idx < children.length; idx++) {
+          const row = children[idx];
           
-          // Also try getting text from the whole row
+          // Get all text content from the row
           const rowText = row.textContent || '';
           
           // Find date in row
           const dateMatch = rowText.match(/\d{1,2}\/\d{1,2}\/\d{4}/);
           const date = dateMatch ? dateMatch[0] : '';
           
+          // Get cells - SlickGrid uses divs with class "slick-cell"
+          const cells = row.querySelectorAll('.slick-cell');
+          const cellTexts: string[] = [];
+          cells.forEach(c => {
+            const text = c.textContent?.trim();
+            if (text) cellTexts.push(text);
+          });
+          
           if (date || cellTexts.length > 0) {
             docs.push({
-              id: `slick-${idx}`,
+              id: 'slick-' + idx,
               type: cellTexts[0] || 'Document',
               date: date || 'Unknown',
               category: 'LUST Technical',
@@ -176,23 +174,25 @@ export class IEPAScraper {
               rowIndex: idx,
             });
           }
-        });
+        }
+      } else {
+        console.log('grid-canvas not found');
       }
       
-      // Fallback: look for any divs containing dates
+      // Fallback: look for dates in page
       if (docs.length === 0) {
-        console.log('Trying date-based detection...');
+        console.log('Using date-based fallback...');
         const allText = document.body.innerText;
         const dates = allText.match(/\d{1,2}\/\d{1,2}\/\d{4}/g) || [];
         const uniqueDates = [...new Set(dates)];
         
         uniqueDates.forEach((date, idx) => {
           docs.push({
-            id: `date-${idx}`,
+            id: 'date-' + idx,
             type: 'Document',
             date: date,
             category: 'LUST Technical',
-            description: `Document from ${date}`,
+            description: 'Document from ' + date,
             rowIndex: idx,
           });
         });
@@ -219,14 +219,8 @@ export class IEPAScraper {
         await this.page.waitForTimeout(8000);
       }
 
-      // Find SlickGrid rows
-      const gridCanvas = await this.page.$('.grid-canvas, [class*="grid-canvas"]');
-      if (!gridCanvas) {
-        console.log('Grid canvas not found');
-        return null;
-      }
-
-      const rows = await gridCanvas.$$(':scope > div, .slick-row');
+      // Find SlickGrid rows using Playwright's selector
+      const rows = await this.page.$$('.grid-canvas > div');
       console.log(`Found ${rows.length} SlickGrid rows`);
 
       if (rowIdx >= rows.length) {
@@ -263,7 +257,8 @@ export class IEPAScraper {
       const pdfSource = await viewerPage.evaluate(() => {
         // Check iframes
         const iframes = document.querySelectorAll('iframe');
-        for (const iframe of iframes) {
+        for (let i = 0; i < iframes.length; i++) {
+          const iframe = iframes[i];
           if (iframe.src && (iframe.src.includes('.pdf') || iframe.src.includes('GetDocument') || iframe.src.includes('Viewer'))) {
             return { type: 'iframe', src: iframe.src };
           }
@@ -271,26 +266,22 @@ export class IEPAScraper {
         
         // Check objects
         const objects = document.querySelectorAll('object');
-        for (const obj of objects) {
+        for (let i = 0; i < objects.length; i++) {
+          const obj = objects[i];
           if (obj.data) return { type: 'object', src: obj.data };
         }
         
         // Check embeds
         const embeds = document.querySelectorAll('embed');
-        for (const embed of embeds) {
+        for (let i = 0; i < embeds.length; i++) {
+          const embed = embeds[i];
           if (embed.src) return { type: 'embed', src: embed.src };
-        }
-
-        // Check for PDF.js canvas (some viewers use this)
-        const canvas = document.querySelector('canvas');
-        if (canvas) {
-          const parent = canvas.closest('[class*="viewer"], [class*="pdf"]');
-          if (parent) return { type: 'canvas', src: null };
         }
 
         // Look for download links
         const links = document.querySelectorAll('a');
-        for (const link of links) {
+        for (let i = 0; i < links.length; i++) {
+          const link = links[i];
           const href = link.getAttribute('href') || '';
           const text = link.textContent?.toLowerCase() || '';
           if (href.includes('.pdf') || href.includes('GetDocument') || href.includes('Download') ||
@@ -299,22 +290,12 @@ export class IEPAScraper {
           }
         }
 
-        // Look for buttons with download functionality
-        const buttons = document.querySelectorAll('button, [role="button"]');
-        for (const btn of buttons) {
-          const text = btn.textContent?.toLowerCase() || '';
-          const title = btn.getAttribute('title')?.toLowerCase() || '';
-          if (text.includes('download') || title.includes('download')) {
-            return { type: 'button', src: null };
-          }
-        }
-
         return null;
       });
 
-      console.log('PDF source found:', pdfSource);
+      console.log('PDF source:', JSON.stringify(pdfSource));
 
-      if (pdfSource?.src) {
+      if (pdfSource && pdfSource.src) {
         try {
           const fullUrl = pdfSource.src.startsWith('http') ? pdfSource.src : new URL(pdfSource.src, viewerPage.url()).href;
           console.log(`Fetching PDF from: ${fullUrl}`);
@@ -340,7 +321,7 @@ export class IEPAScraper {
 
       // Method 2: Click download button
       console.log('Trying download button...');
-      const downloadBtn = await viewerPage.$('[title*="ownload" i], [class*="download" i], button:has-text("Download"), a:has-text("Download")');
+      const downloadBtn = await viewerPage.$('[title*="ownload" i], [class*="download" i]');
       
       if (downloadBtn) {
         console.log('Found download button, clicking...');
@@ -366,45 +347,8 @@ export class IEPAScraper {
             }
           }
         } catch (e) {
-          console.log('Download button click failed:', e);
+          console.log('Download button failed:', e);
         }
-      }
-
-      // Method 3: Try right-click context menu
-      console.log('Trying right-click download...');
-      try {
-        // Find the document area
-        const docArea = await viewerPage.$('canvas, [class*="viewer"], [class*="document"], img, object, embed');
-        if (docArea) {
-          await docArea.click({ button: 'right' });
-          await viewerPage.waitForTimeout(1000);
-          
-          // Look for "Download as PDF" or similar option
-          const menuItem = await viewerPage.$('text=/download|save|pdf/i');
-          if (menuItem) {
-            const [download] = await Promise.all([
-              viewerPage.waitForEvent('download', { timeout: 15000 }),
-              menuItem.click(),
-            ]);
-            
-            if (download) {
-              const path = await download.path();
-              if (path) {
-                const fs = require('fs');
-                const buffer = fs.readFileSync(path);
-                console.log(`SUCCESS via context menu! ${buffer.length} bytes`);
-                if (viewerPage !== this.page) await viewerPage.close();
-                return {
-                  ...doc,
-                  pdfBuffer: buffer,
-                  filename: download.suggestedFilename() || `doc_${doc.date}.pdf`,
-                };
-              }
-            }
-          }
-        }
-      } catch (e) {
-        console.log('Right-click method failed');
       }
 
       // Cleanup
