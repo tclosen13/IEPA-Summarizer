@@ -1,6 +1,6 @@
 /**
- * IEPA Document Explorer Scraper v8
- * Fixed CSS selector for SlickGrid
+ * IEPA Document Explorer Scraper v9
+ * Better DocuWare viewer PDF extraction
  */
 
 import { chromium, Browser, Page, BrowserContext } from 'playwright';
@@ -109,14 +109,11 @@ export class IEPAScraper {
     await this.page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
     await this.page.waitForTimeout(3000);
 
-    // Find DocuWare link
     const docuwareHref = await this.page.evaluate(() => {
       const allLinks = document.querySelectorAll('a');
-      for (const link of allLinks) {
-        const href = link.getAttribute('href') || '';
-        if (href.toLowerCase().includes('docuware')) {
-          return href;
-        }
+      for (let i = 0; i < allLinks.length; i++) {
+        const href = allLinks[i].getAttribute('href') || '';
+        if (href.toLowerCase().includes('docuware')) return href;
       }
       return null;
     });
@@ -130,33 +127,19 @@ export class IEPAScraper {
     console.log(`Opening DocuWare: ${this.docuwareUrl}`);
 
     await this.page.goto(this.docuwareUrl, { waitUntil: 'networkidle', timeout: 60000 });
-    
-    console.log('Waiting for DocuWare SlickGrid to load...');
+    console.log('Waiting for SlickGrid...');
     await this.page.waitForTimeout(8000);
 
-    // Extract documents from SlickGrid
     const documents = await this.page.evaluate(() => {
       const docs: any[] = [];
-      
-      // SlickGrid stores rows in .grid-canvas as direct children divs
       const gridCanvas = document.querySelector('.grid-canvas');
       
       if (gridCanvas) {
-        console.log('Found grid-canvas with ' + gridCanvas.children.length + ' children');
-        
-        // Each child of grid-canvas is a row
         const children = gridCanvas.children;
         for (let idx = 0; idx < children.length; idx++) {
           const row = children[idx];
-          
-          // Get all text content from the row
           const rowText = row.textContent || '';
-          
-          // Find date in row
           const dateMatch = rowText.match(/\d{1,2}\/\d{1,2}\/\d{4}/);
-          const date = dateMatch ? dateMatch[0] : '';
-          
-          // Get cells - SlickGrid uses divs with class "slick-cell"
           const cells = row.querySelectorAll('.slick-cell');
           const cellTexts: string[] = [];
           cells.forEach(c => {
@@ -164,28 +147,23 @@ export class IEPAScraper {
             if (text) cellTexts.push(text);
           });
           
-          if (date || cellTexts.length > 0) {
+          if (dateMatch || cellTexts.length > 0) {
             docs.push({
               id: 'slick-' + idx,
               type: cellTexts[0] || 'Document',
-              date: date || 'Unknown',
+              date: dateMatch ? dateMatch[0] : 'Unknown',
               category: 'LUST Technical',
-              description: cellTexts.slice(1, 4).filter(t => t).join(' | ') || rowText.substring(0, 100),
+              description: cellTexts.slice(1, 4).filter(t => t).join(' | '),
               rowIndex: idx,
             });
           }
         }
-      } else {
-        console.log('grid-canvas not found');
       }
       
-      // Fallback: look for dates in page
       if (docs.length === 0) {
-        console.log('Using date-based fallback...');
         const allText = document.body.innerText;
         const dates = allText.match(/\d{1,2}\/\d{1,2}\/\d{4}/g) || [];
         const uniqueDates = [...new Set(dates)];
-        
         uniqueDates.forEach((date, idx) => {
           docs.push({
             id: 'date-' + idx,
@@ -214,131 +192,107 @@ export class IEPAScraper {
     try {
       // Make sure we're on DocuWare
       if (!this.page.url().toLowerCase().includes('docuware') && this.docuwareUrl) {
-        console.log('Navigating to DocuWare...');
         await this.page.goto(this.docuwareUrl, { waitUntil: 'networkidle', timeout: 60000 });
         await this.page.waitForTimeout(8000);
       }
 
-      // Find SlickGrid rows using Playwright's selector
       const rows = await this.page.$$('.grid-canvas > div');
-      console.log(`Found ${rows.length} SlickGrid rows`);
+      console.log(`Found ${rows.length} rows`);
 
       if (rowIdx >= rows.length) {
         console.log(`Row ${rowIdx} out of range`);
         return null;
       }
 
-      const targetRow = rows[rowIdx];
-
-      // Step 1: Click to select the row
-      console.log('Clicking row to select...');
-      await targetRow.click();
-      await this.page.waitForTimeout(2000);
-
-      // Step 2: Double-click to open the document viewer
-      console.log('Double-clicking to open document...');
-      await targetRow.dblclick();
-      await this.page.waitForTimeout(6000);
-
-      // Check for new pages/tabs
-      const pages = this.context.pages();
-      console.log(`Total open pages: ${pages.length}`);
+      // Double-click to open viewer
+      console.log('Double-clicking row...');
+      await rows[rowIdx].dblclick();
       
-      let viewerPage = pages[pages.length - 1];
-      if (viewerPage !== this.page) {
-        console.log(`Viewer opened in new tab: ${viewerPage.url()}`);
-        await viewerPage.waitForTimeout(4000);
+      // Wait for new tab to open
+      await this.page.waitForTimeout(3000);
+      
+      const pages = this.context.pages();
+      if (pages.length < 2) {
+        console.log('No new tab opened');
+        return null;
       }
 
-      // Try to find PDF source
-      console.log('Looking for PDF...');
+      const viewerPage = pages[pages.length - 1];
+      console.log(`Viewer URL: ${viewerPage.url()}`);
+
+      // Wait longer for viewer to fully load the PDF
+      console.log('Waiting for viewer to load PDF...');
+      await viewerPage.waitForTimeout(8000);
+
+      // Try to intercept PDF requests by looking at what the viewer loaded
+      // DocuWare typically loads PDF via XHR/fetch
       
-      // Method 1: Check for iframe/object/embed with PDF
-      const pdfSource = await viewerPage.evaluate(() => {
-        // Check iframes
-        const iframes = document.querySelectorAll('iframe');
-        for (let i = 0; i < iframes.length; i++) {
-          const iframe = iframes[i];
-          if (iframe.src && (iframe.src.includes('.pdf') || iframe.src.includes('GetDocument') || iframe.src.includes('Viewer'))) {
-            return { type: 'iframe', src: iframe.src };
+      // Method 1: Look for canvas (PDF.js renders to canvas)
+      const hasCanvas = await viewerPage.$('canvas');
+      if (hasCanvas) {
+        console.log('Found canvas - PDF is rendered');
+      }
+
+      // Method 2: Find the actual PDF download endpoint
+      // DocuWare uses specific API endpoints for PDF download
+      const pdfEndpoint = await viewerPage.evaluate(() => {
+        // Check for any elements with PDF-related attributes
+        const allElements = document.querySelectorAll('*');
+        for (let i = 0; i < allElements.length; i++) {
+          const el = allElements[i];
+          const attrs = el.attributes;
+          for (let j = 0; j < attrs.length; j++) {
+            const attr = attrs[j];
+            if (attr.value && (
+              attr.value.includes('GetDocument') ||
+              attr.value.includes('Download') ||
+              attr.value.includes('.pdf') ||
+              attr.value.includes('FileCabinet')
+            )) {
+              return { attr: attr.name, value: attr.value };
+            }
           }
         }
         
-        // Check objects
-        const objects = document.querySelectorAll('object');
-        for (let i = 0; i < objects.length; i++) {
-          const obj = objects[i];
-          if (obj.data) return { type: 'object', src: obj.data };
-        }
-        
-        // Check embeds
-        const embeds = document.querySelectorAll('embed');
-        for (let i = 0; i < embeds.length; i++) {
-          const embed = embeds[i];
-          if (embed.src) return { type: 'embed', src: embed.src };
+        // Check script content for PDF URLs
+        const scripts = document.querySelectorAll('script');
+        for (let i = 0; i < scripts.length; i++) {
+          const content = scripts[i].textContent || '';
+          const match = content.match(/["'](https?:\/\/[^"']*(?:GetDocument|Download|\.pdf)[^"']*)/i);
+          if (match) return { attr: 'script', value: match[1] };
         }
 
-        // Look for download links
-        const links = document.querySelectorAll('a');
-        for (let i = 0; i < links.length; i++) {
-          const link = links[i];
-          const href = link.getAttribute('href') || '';
-          const text = link.textContent?.toLowerCase() || '';
-          if (href.includes('.pdf') || href.includes('GetDocument') || href.includes('Download') ||
-              text.includes('download') || text.includes('pdf')) {
-            return { type: 'link', src: href };
-          }
+        // Check for data attributes
+        const viewer = document.querySelector('[class*="viewer"], [class*="Viewer"]');
+        if (viewer) {
+          return { 
+            attr: 'viewer-class', 
+            value: viewer.className,
+            html: viewer.innerHTML.substring(0, 500)
+          };
         }
 
         return null;
       });
 
-      console.log('PDF source:', JSON.stringify(pdfSource));
+      console.log('PDF endpoint search:', JSON.stringify(pdfEndpoint));
 
-      if (pdfSource && pdfSource.src) {
-        try {
-          const fullUrl = pdfSource.src.startsWith('http') ? pdfSource.src : new URL(pdfSource.src, viewerPage.url()).href;
-          console.log(`Fetching PDF from: ${fullUrl}`);
-          
-          const response = await viewerPage.request.get(fullUrl);
-          const buffer = await response.body();
-          
-          console.log(`Got ${buffer.length} bytes, first byte: ${buffer[0]}`);
-          
-          if (buffer.length > 500 && buffer[0] === 0x25) { // %PDF
-            console.log('SUCCESS! Valid PDF received');
-            if (viewerPage !== this.page) await viewerPage.close();
-            return {
-              ...doc,
-              pdfBuffer: buffer,
-              filename: `doc_${doc.date.replace(/\//g, '-')}.pdf`,
-            };
-          }
-        } catch (e) {
-          console.log('PDF fetch error:', e);
-        }
-      }
-
-      // Method 2: Click download button
-      console.log('Trying download button...');
-      const downloadBtn = await viewerPage.$('[title*="ownload" i], [class*="download" i]');
-      
-      if (downloadBtn) {
-        console.log('Found download button, clicking...');
-        try {
-          const [download] = await Promise.all([
-            viewerPage.waitForEvent('download', { timeout: 20000 }),
-            downloadBtn.click(),
-          ]);
-          
-          if (download) {
-            console.log(`Download started: ${download.suggestedFilename()}`);
-            const path = await download.path();
-            if (path) {
-              const fs = require('fs');
-              const buffer = fs.readFileSync(path);
-              console.log(`SUCCESS! Downloaded ${buffer.length} bytes`);
-              if (viewerPage !== this.page) await viewerPage.close();
+      // Method 3: Use keyboard shortcut Ctrl+S
+      console.log('Trying Ctrl+S...');
+      try {
+        const downloadPromise = viewerPage.waitForEvent('download', { timeout: 10000 });
+        await viewerPage.keyboard.press('Control+s');
+        const download = await downloadPromise;
+        
+        if (download) {
+          console.log(`Ctrl+S triggered download: ${download.suggestedFilename()}`);
+          const path = await download.path();
+          if (path) {
+            const fs = require('fs');
+            const buffer = fs.readFileSync(path);
+            if (buffer[0] === 0x25) {
+              console.log('SUCCESS via Ctrl+S!');
+              await viewerPage.close();
               return {
                 ...doc,
                 pdfBuffer: buffer,
@@ -346,23 +300,105 @@ export class IEPAScraper {
               };
             }
           }
+        }
+      } catch (e) {
+        console.log('Ctrl+S failed');
+      }
+
+      // Method 4: Look for print/download menu
+      console.log('Looking for menu buttons...');
+      const menuButtons = await viewerPage.$$('[class*="menu"], [class*="Menu"], [class*="toolbar"], [class*="Toolbar"]');
+      console.log(`Found ${menuButtons.length} menu/toolbar elements`);
+
+      // Try clicking on common download icons
+      const downloadIcons = [
+        '[class*="download"]',
+        '[class*="Download"]',
+        '[title*="ownload"]',
+        '[aria-label*="ownload"]',
+        'button[class*="save"]',
+        'button[class*="Save"]',
+        '[class*="ico-download"]',
+        '[class*="pdf"]',
+        'a[download]',
+      ];
+
+      for (const selector of downloadIcons) {
+        try {
+          const btn = await viewerPage.$(selector);
+          if (btn) {
+            console.log(`Found button: ${selector}`);
+            const downloadPromise = viewerPage.waitForEvent('download', { timeout: 10000 });
+            await btn.click();
+            
+            try {
+              const download = await downloadPromise;
+              const path = await download.path();
+              if (path) {
+                const fs = require('fs');
+                const buffer = fs.readFileSync(path);
+                if (buffer.length > 1000 && buffer[0] === 0x25) {
+                  console.log(`SUCCESS via ${selector}!`);
+                  await viewerPage.close();
+                  return {
+                    ...doc,
+                    pdfBuffer: buffer,
+                    filename: download.suggestedFilename() || `doc_${doc.date}.pdf`,
+                  };
+                }
+              }
+            } catch (e) {
+              console.log(`${selector} didn't trigger download`);
+            }
+          }
         } catch (e) {
-          console.log('Download button failed:', e);
+          continue;
+        }
+      }
+
+      // Method 5: Check network requests for PDF
+      // (This would require setting up request interception earlier)
+      
+      // Method 6: Take the viewer URL and try common DocuWare API patterns
+      const viewerUrl = viewerPage.url();
+      const authMatch = viewerUrl.match(/_auth=([^&]+)/);
+      if (authMatch) {
+        const auth = authMatch[1];
+        // Try common DocuWare download endpoints
+        const downloadUrls = [
+          `https://docuware7.illinois.gov/DocuWare/PlatformRO/WebClient/Client/Document?_auth=${auth}`,
+          `https://docuware7.illinois.gov/DocuWare/Platform/FileCabinets/Download?_auth=${auth}`,
+        ];
+        
+        for (const downloadUrl of downloadUrls) {
+          try {
+            console.log(`Trying: ${downloadUrl.substring(0, 80)}...`);
+            const response = await viewerPage.request.get(downloadUrl);
+            const buffer = await response.body();
+            console.log(`Got ${buffer.length} bytes, first: ${buffer[0]}`);
+            
+            if (buffer.length > 1000 && buffer[0] === 0x25) {
+              console.log('SUCCESS via direct URL!');
+              await viewerPage.close();
+              return {
+                ...doc,
+                pdfBuffer: buffer,
+                filename: `doc_${doc.date.replace(/\//g, '-')}.pdf`,
+              };
+            }
+          } catch (e) {
+            console.log('URL failed');
+          }
         }
       }
 
       // Cleanup
-      if (viewerPage !== this.page) {
-        await viewerPage.close();
-      }
-      await this.page.keyboard.press('Escape');
-      await this.page.waitForTimeout(1000);
-
-      console.log('All download methods failed');
+      await viewerPage.close();
+      console.log('All methods failed');
       return null;
 
     } catch (error) {
-      console.error(`Download error: ${error}`);
+      console.error(`Error: ${error}`);
       return null;
     }
   }
