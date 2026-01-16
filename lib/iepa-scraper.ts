@@ -1,6 +1,6 @@
 /**
- * IEPA Document Explorer Scraper v9
- * Better DocuWare viewer PDF extraction
+ * IEPA Document Explorer Scraper v10
+ * DocuWare Knockout.js menu-based download
  */
 
 import { chromium, Browser, Page, BrowserContext } from 'playwright';
@@ -207,8 +207,6 @@ export class IEPAScraper {
       // Double-click to open viewer
       console.log('Double-clicking row...');
       await rows[rowIdx].dblclick();
-      
-      // Wait for new tab to open
       await this.page.waitForTimeout(3000);
       
       const pages = this.context.pages();
@@ -220,116 +218,172 @@ export class IEPAScraper {
       const viewerPage = pages[pages.length - 1];
       console.log(`Viewer URL: ${viewerPage.url()}`);
 
-      // Wait longer for viewer to fully load the PDF
-      console.log('Waiting for viewer to load PDF...');
-      await viewerPage.waitForTimeout(8000);
+      // Wait for viewer to fully load
+      console.log('Waiting for viewer...');
+      await viewerPage.waitForTimeout(10000);
 
-      // Try to intercept PDF requests by looking at what the viewer loaded
-      // DocuWare typically loads PDF via XHR/fetch
-      
-      // Method 1: Look for canvas (PDF.js renders to canvas)
-      const hasCanvas = await viewerPage.$('canvas');
-      if (hasCanvas) {
-        console.log('Found canvas - PDF is rendered');
-      }
-
-      // Method 2: Find the actual PDF download endpoint
-      // DocuWare uses specific API endpoints for PDF download
-      const pdfEndpoint = await viewerPage.evaluate(() => {
-        // Check for any elements with PDF-related attributes
-        const allElements = document.querySelectorAll('*');
-        for (let i = 0; i < allElements.length; i++) {
-          const el = allElements[i];
-          const attrs = el.attributes;
-          for (let j = 0; j < attrs.length; j++) {
-            const attr = attrs[j];
-            if (attr.value && (
-              attr.value.includes('GetDocument') ||
-              attr.value.includes('Download') ||
-              attr.value.includes('.pdf') ||
-              attr.value.includes('FileCabinet')
-            )) {
-              return { attr: attr.name, value: attr.value };
-            }
+      // Find and log all buttons/clickable elements
+      const buttons = await viewerPage.evaluate(() => {
+        const result: any[] = [];
+        document.querySelectorAll('button, a, [role="button"], [data-bind]').forEach((el, i) => {
+          const text = el.textContent?.trim().substring(0, 50);
+          const dataBind = el.getAttribute('data-bind');
+          const className = el.className;
+          const title = el.getAttribute('title');
+          
+          if (dataBind?.includes('ownload') || text?.toLowerCase().includes('download') || 
+              className?.toLowerCase().includes('download') || title?.toLowerCase().includes('download')) {
+            result.push({
+              index: i,
+              tag: el.tagName,
+              text,
+              dataBind: dataBind?.substring(0, 100),
+              class: className?.substring(0, 50),
+              title
+            });
           }
-        }
-        
-        // Check script content for PDF URLs
-        const scripts = document.querySelectorAll('script');
-        for (let i = 0; i < scripts.length; i++) {
-          const content = scripts[i].textContent || '';
-          const match = content.match(/["'](https?:\/\/[^"']*(?:GetDocument|Download|\.pdf)[^"']*)/i);
-          if (match) return { attr: 'script', value: match[1] };
-        }
-
-        // Check for data attributes
-        const viewer = document.querySelector('[class*="viewer"], [class*="Viewer"]');
-        if (viewer) {
-          return { 
-            attr: 'viewer-class', 
-            value: viewer.className,
-            html: viewer.innerHTML.substring(0, 500)
-          };
-        }
-
-        return null;
+        });
+        return result;
       });
+      
+      console.log('Download-related elements:', JSON.stringify(buttons, null, 2));
 
-      console.log('PDF endpoint search:', JSON.stringify(pdfEndpoint));
-
-      // Method 3: Use keyboard shortcut Ctrl+S
-      console.log('Trying Ctrl+S...');
-      try {
-        const downloadPromise = viewerPage.waitForEvent('download', { timeout: 10000 });
-        await viewerPage.keyboard.press('Control+s');
-        const download = await downloadPromise;
-        
-        if (download) {
-          console.log(`Ctrl+S triggered download: ${download.suggestedFilename()}`);
-          const path = await download.path();
-          if (path) {
-            const fs = require('fs');
-            const buffer = fs.readFileSync(path);
-            if (buffer[0] === 0x25) {
-              console.log('SUCCESS via Ctrl+S!');
-              await viewerPage.close();
-              return {
-                ...doc,
-                pdfBuffer: buffer,
-                filename: download.suggestedFilename() || `doc_${doc.date}.pdf`,
-              };
+      // Try clicking elements with download data-bind
+      for (const btn of buttons) {
+        try {
+          console.log(`Trying element: ${btn.tag} - ${btn.text || btn.title || btn.class}`);
+          
+          // Find the element
+          let element = null;
+          if (btn.dataBind) {
+            element = await viewerPage.$(`[data-bind*="Download"]`);
+          }
+          if (!element && btn.title) {
+            element = await viewerPage.$(`[title="${btn.title}"]`);
+          }
+          if (!element && btn.class) {
+            element = await viewerPage.$(`.${btn.class.split(' ')[0]}`);
+          }
+          
+          if (element) {
+            // Click to open dropdown menu
+            console.log('Clicking download button...');
+            await element.click();
+            await viewerPage.waitForTimeout(2000);
+            
+            // Look for dropdown menu items
+            const menuItems = await viewerPage.evaluate(() => {
+              const items: any[] = [];
+              // Look for visible menu items
+              document.querySelectorAll('[class*="menu"] li, [class*="dropdown"] li, [class*="Menu"] a, ul li a, [role="menuitem"]').forEach((item, i) => {
+                const text = item.textContent?.trim();
+                const style = window.getComputedStyle(item);
+                if (style.display !== 'none' && style.visibility !== 'hidden') {
+                  items.push({ index: i, text });
+                }
+              });
+              return items;
+            });
+            
+            console.log('Menu items found:', JSON.stringify(menuItems));
+            
+            // Find "PDF without annotations" or similar
+            for (const item of menuItems) {
+              if (item.text && (
+                item.text.toLowerCase().includes('pdf') || 
+                item.text.toLowerCase().includes('download') ||
+                item.text.toLowerCase().includes('without')
+              )) {
+                console.log(`Clicking menu item: ${item.text}`);
+                
+                // Click the menu item
+                const menuItem = await viewerPage.$(`text=${item.text}`);
+                if (menuItem) {
+                  const downloadPromise = viewerPage.waitForEvent('download', { timeout: 30000 });
+                  await menuItem.click();
+                  
+                  try {
+                    const download = await downloadPromise;
+                    console.log(`Download started: ${download.suggestedFilename()}`);
+                    const path = await download.path();
+                    if (path) {
+                      const fs = require('fs');
+                      const buffer = fs.readFileSync(path);
+                      if (buffer.length > 1000 && buffer[0] === 0x25) {
+                        console.log('SUCCESS!');
+                        await viewerPage.close();
+                        return {
+                          ...doc,
+                          pdfBuffer: buffer,
+                          filename: download.suggestedFilename() || `doc_${doc.date}.pdf`,
+                        };
+                      }
+                    }
+                  } catch (e) {
+                    console.log('Menu item download failed');
+                  }
+                }
+              }
+            }
+            
+            // If no menu appeared, try clicking any visible download option
+            const pdfOption = await viewerPage.$('text=/PDF|Download/i');
+            if (pdfOption) {
+              console.log('Found PDF/Download text, clicking...');
+              const downloadPromise = viewerPage.waitForEvent('download', { timeout: 30000 });
+              await pdfOption.click();
+              
+              try {
+                const download = await downloadPromise;
+                const path = await download.path();
+                if (path) {
+                  const fs = require('fs');
+                  const buffer = fs.readFileSync(path);
+                  if (buffer.length > 1000 && buffer[0] === 0x25) {
+                    console.log('SUCCESS via PDF option!');
+                    await viewerPage.close();
+                    return {
+                      ...doc,
+                      pdfBuffer: buffer,
+                      filename: download.suggestedFilename() || `doc_${doc.date}.pdf`,
+                    };
+                  }
+                }
+              } catch (e) {
+                console.log('PDF option failed');
+              }
             }
           }
+        } catch (e) {
+          console.log('Button click failed:', e);
         }
-      } catch (e) {
-        console.log('Ctrl+S failed');
       }
 
-      // Method 4: Look for print/download menu
-      console.log('Looking for menu buttons...');
-      const menuButtons = await viewerPage.$$('[class*="menu"], [class*="Menu"], [class*="toolbar"], [class*="Toolbar"]');
-      console.log(`Found ${menuButtons.length} menu/toolbar elements`);
-
-      // Try clicking on common download icons
-      const downloadIcons = [
-        '[class*="download"]',
-        '[class*="Download"]',
-        '[title*="ownload"]',
-        '[aria-label*="ownload"]',
-        'button[class*="save"]',
-        'button[class*="Save"]',
-        '[class*="ico-download"]',
-        '[class*="pdf"]',
-        'a[download]',
-      ];
-
-      for (const selector of downloadIcons) {
-        try {
-          const btn = await viewerPage.$(selector);
-          if (btn) {
-            console.log(`Found button: ${selector}`);
-            const downloadPromise = viewerPage.waitForEvent('download', { timeout: 10000 });
-            await btn.click();
+      // Method: Try right-click on document
+      console.log('Trying right-click context menu...');
+      try {
+        const canvas = await viewerPage.$('canvas');
+        if (canvas) {
+          await canvas.click({ button: 'right' });
+          await viewerPage.waitForTimeout(1500);
+          
+          // Look for context menu
+          const contextItems = await viewerPage.evaluate(() => {
+            const items: string[] = [];
+            document.querySelectorAll('[class*="context"] li, [class*="menu"] li').forEach(item => {
+              const text = item.textContent?.trim();
+              if (text) items.push(text);
+            });
+            return items;
+          });
+          
+          console.log('Context menu items:', contextItems);
+          
+          // Click on PDF download option
+          const pdfItem = await viewerPage.$('text=/Download.*PDF|PDF.*without/i');
+          if (pdfItem) {
+            const downloadPromise = viewerPage.waitForEvent('download', { timeout: 30000 });
+            await pdfItem.click();
             
             try {
               const download = await downloadPromise;
@@ -338,7 +392,7 @@ export class IEPAScraper {
                 const fs = require('fs');
                 const buffer = fs.readFileSync(path);
                 if (buffer.length > 1000 && buffer[0] === 0x25) {
-                  console.log(`SUCCESS via ${selector}!`);
+                  console.log('SUCCESS via context menu!');
                   await viewerPage.close();
                   return {
                     ...doc,
@@ -348,51 +402,14 @@ export class IEPAScraper {
                 }
               }
             } catch (e) {
-              console.log(`${selector} didn't trigger download`);
+              console.log('Context menu download failed');
             }
           }
-        } catch (e) {
-          continue;
         }
+      } catch (e) {
+        console.log('Right-click failed:', e);
       }
 
-      // Method 5: Check network requests for PDF
-      // (This would require setting up request interception earlier)
-      
-      // Method 6: Take the viewer URL and try common DocuWare API patterns
-      const viewerUrl = viewerPage.url();
-      const authMatch = viewerUrl.match(/_auth=([^&]+)/);
-      if (authMatch) {
-        const auth = authMatch[1];
-        // Try common DocuWare download endpoints
-        const downloadUrls = [
-          `https://docuware7.illinois.gov/DocuWare/PlatformRO/WebClient/Client/Document?_auth=${auth}`,
-          `https://docuware7.illinois.gov/DocuWare/Platform/FileCabinets/Download?_auth=${auth}`,
-        ];
-        
-        for (const downloadUrl of downloadUrls) {
-          try {
-            console.log(`Trying: ${downloadUrl.substring(0, 80)}...`);
-            const response = await viewerPage.request.get(downloadUrl);
-            const buffer = await response.body();
-            console.log(`Got ${buffer.length} bytes, first: ${buffer[0]}`);
-            
-            if (buffer.length > 1000 && buffer[0] === 0x25) {
-              console.log('SUCCESS via direct URL!');
-              await viewerPage.close();
-              return {
-                ...doc,
-                pdfBuffer: buffer,
-                filename: `doc_${doc.date.replace(/\//g, '-')}.pdf`,
-              };
-            }
-          } catch (e) {
-            console.log('URL failed');
-          }
-        }
-      }
-
-      // Cleanup
       await viewerPage.close();
       console.log('All methods failed');
       return null;
