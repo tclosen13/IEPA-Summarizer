@@ -307,3 +307,157 @@ export class IEPAScraper {
 
           if (href) {
             docs.push({
+              id: `doc-${index}`,
+              type: type.substring(0, 100),
+              date: date || 'Unknown',
+              category: category || 'Document',
+              description: description.substring(0, 200),
+              viewerUrl: href.startsWith('http') ? href : `https://webapps.illinois.gov${href}`,
+            });
+          }
+        });
+      }
+
+      return docs;
+    });
+
+    console.log(`Found ${documents.length} documents`);
+    return documents;
+  }
+
+  async downloadDocument(doc: DocumentInfo): Promise<DownloadedDocument | null> {
+    if (!this.page || !this.context) throw new Error('Browser not initialized');
+
+    console.log(`Downloading: ${doc.type} (${doc.date})`);
+
+    try {
+      if (!doc.viewerUrl) return null;
+
+      const downloadPage = await this.context.newPage();
+      
+      try {
+        // Set up download handling
+        const downloadPromise = downloadPage.waitForEvent('download', { timeout: 30000 }).catch(() => null);
+        
+        await downloadPage.goto(doc.viewerUrl, {
+          waitUntil: 'networkidle',
+          timeout: 30000,
+        });
+
+        await downloadPage.waitForTimeout(2000);
+
+        // Check if we got a PDF directly
+        const currentUrl = downloadPage.url();
+        
+        // Try to get PDF content directly via fetch
+        try {
+          const response = await downloadPage.request.get(doc.viewerUrl);
+          const contentType = response.headers()['content-type'] || '';
+          
+          if (contentType.includes('pdf')) {
+            const buffer = await response.body();
+            await downloadPage.close();
+            
+            return {
+              ...doc,
+              pdfBuffer: buffer,
+              filename: `${doc.type}_${doc.date.replace(/\//g, '-')}.pdf`,
+            };
+          }
+        } catch (e) {
+          console.log('Direct fetch failed, trying browser download...');
+        }
+
+        // Look for PDF viewer iframe or download button
+        const pdfFrame = await downloadPage.$('iframe[src*=".pdf"], iframe[src*="DocuWare"]');
+        if (pdfFrame) {
+          const frameSrc = await pdfFrame.getAttribute('src');
+          if (frameSrc) {
+            const response = await downloadPage.request.get(frameSrc);
+            const buffer = await response.body();
+            await downloadPage.close();
+            
+            return {
+              ...doc,
+              pdfBuffer: buffer,
+              filename: `${doc.type}_${doc.date.replace(/\//g, '-')}.pdf`,
+            };
+          }
+        }
+
+        // Try clicking download button
+        const downloadBtn = await downloadPage.$('a[href*=".pdf"], button:has-text("Download"), a:has-text("Download")');
+        if (downloadBtn) {
+          const href = await downloadBtn.getAttribute('href');
+          if (href && href.includes('.pdf')) {
+            const response = await downloadPage.request.get(href);
+            const buffer = await response.body();
+            await downloadPage.close();
+            
+            return {
+              ...doc,
+              pdfBuffer: buffer,
+              filename: `${doc.type}_${doc.date.replace(/\//g, '-')}.pdf`,
+            };
+          }
+        }
+
+        // Check for download event
+        const download = await downloadPromise;
+        if (download) {
+          const path = await download.path();
+          if (path) {
+            const fs = require('fs');
+            const buffer = fs.readFileSync(path);
+            await downloadPage.close();
+            
+            return {
+              ...doc,
+              pdfBuffer: buffer,
+              filename: download.suggestedFilename(),
+            };
+          }
+        }
+
+        await downloadPage.close();
+        return null;
+
+      } catch (error) {
+        console.error(`Download error: ${error}`);
+        await downloadPage.close();
+        return null;
+      }
+
+    } catch (error) {
+      console.error(`Download error for ${doc.type}:`, error);
+      return null;
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.browser) {
+      await this.browser.close();
+      this.browser = null;
+      this.context = null;
+      this.page = null;
+      this.isInitialized = false;
+    }
+  }
+}
+
+let scraperInstance: IEPAScraper | null = null;
+
+export async function getScraper(): Promise<IEPAScraper> {
+  if (!scraperInstance) {
+    scraperInstance = new IEPAScraper();
+    await scraperInstance.init();
+  }
+  return scraperInstance;
+}
+
+export async function closeScraper(): Promise<void> {
+  if (scraperInstance) {
+    await scraperInstance.close();
+    scraperInstance = null;
+  }
+}
