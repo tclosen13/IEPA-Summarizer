@@ -36,9 +36,6 @@ export class IEPAScraper {
   private page: Page | null = null;
   private isInitialized = false;
 
-  /**
-   * Initialize the browser
-   */
   async init(): Promise<void> {
     if (this.isInitialized) return;
 
@@ -64,9 +61,6 @@ export class IEPAScraper {
     console.log('Browser initialized');
   }
 
-  /**
-   * Search for facilities by name, address, city, zip, or county
-   */
   async searchFacilities(query: string): Promise<FacilityResult[]> {
     if (!this.page) throw new Error('Browser not initialized');
 
@@ -75,83 +69,146 @@ export class IEPAScraper {
     // Navigate to the attribute search page
     await this.page.goto('https://webapps.illinois.gov/EPA/DocumentExplorer/Attributes', {
       waitUntil: 'networkidle',
-      timeout: 30000,
+      timeout: 60000,
     });
 
-    // Wait for the search form to load
-    await this.page.waitForSelector('input[name="Name"], #Name', { timeout: 15000 });
+    // Wait for page to fully load
+    await this.page.waitForTimeout(3000);
 
-    // Try to determine what type of query this is
-    const isNumeric = /^\d+$/.test(query.trim());
-    const isZip = /^\d{5}$/.test(query.trim());
+    // Take screenshot for debugging
+    console.log('Page loaded, looking for search form...');
 
-    if (isZip) {
-      // Search by ZIP
-      await this.page.fill('input[name="Zip"], #Zip', query.trim());
-    } else if (isNumeric) {
-      // Likely a Bureau ID or IEPA ID
-      await this.page.fill('input[name="IepaId"], #IepaId', query.trim());
-    } else {
-      // Search by name (most common)
-      await this.page.fill('input[name="Name"], #Name', query.trim());
+    // Try to find and fill the Name field using various selectors
+    const nameSelectors = [
+      '#Name',
+      'input[name="Name"]',
+      'input[id="Name"]',
+      '[data-val-required*="Name"]',
+      'input[placeholder*="name" i]',
+      'form input[type="text"]:first-of-type'
+    ];
+
+    let filled = false;
+    for (const selector of nameSelectors) {
+      try {
+        const field = await this.page.$(selector);
+        if (field) {
+          await field.fill(query.trim());
+          console.log(`Filled search field using selector: ${selector}`);
+          filled = true;
+          break;
+        }
+      } catch (e) {
+        continue;
+      }
     }
 
-    // Submit the search
-    await this.page.click('button[type="submit"], input[type="submit"]');
+    if (!filled) {
+      // Try filling any visible text input
+      const inputs = await this.page.$$('input[type="text"]:visible');
+      if (inputs.length > 0) {
+        await inputs[0].fill(query.trim());
+        console.log('Filled first visible text input');
+        filled = true;
+      }
+    }
+
+    if (!filled) {
+      throw new Error('Could not find search input field');
+    }
+
+    // Find and click the search button
+    const buttonSelectors = [
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button:has-text("Search")',
+      '.btn-primary',
+      '#btnSearch',
+      'button.btn'
+    ];
+
+    let clicked = false;
+    for (const selector of buttonSelectors) {
+      try {
+        const button = await this.page.$(selector);
+        if (button) {
+          await button.click();
+          console.log(`Clicked button using selector: ${selector}`);
+          clicked = true;
+          break;
+        }
+      } catch (e) {
+        continue;
+      }
+    }
+
+    if (!clicked) {
+      // Try pressing Enter instead
+      await this.page.keyboard.press('Enter');
+      console.log('Pressed Enter to submit');
+    }
 
     // Wait for results to load
     await this.page.waitForLoadState('networkidle');
-    await this.page.waitForTimeout(2000); // Extra wait for dynamic content
+    await this.page.waitForTimeout(3000);
 
     // Extract facility results
     const facilities = await this.page.evaluate(() => {
-      const results: FacilityResult[] = [];
+      const results: any[] = [];
       
-      // Look for facility links in the results
-      const facilityLinks = document.querySelectorAll('a[href*="/EPA/DocumentExplorer/Facility/"]');
-      
-      facilityLinks.forEach((link) => {
-        const href = link.getAttribute('href') || '';
-        const idMatch = href.match(/\/Facility\/(\d+)/);
-        
-        if (idMatch) {
-          const row = link.closest('tr') || link.closest('.facility-item') || link.parentElement;
-          const cells = row?.querySelectorAll('td');
+      // Try multiple selectors for result rows
+      const selectors = [
+        'table tbody tr',
+        '.search-results tr',
+        '.facility-item',
+        '[data-facility-id]',
+        'a[href*="/Facility/"]'
+      ];
+
+      for (const selector of selectors) {
+        const elements = document.querySelectorAll(selector);
+        if (elements.length > 0) {
+          elements.forEach((el, index) => {
+            // Try to find facility link
+            const link = el.querySelector('a[href*="Facility"]') || 
+                        el.querySelector('a[href*="Documents"]') ||
+                        (el.tagName === 'A' ? el : null);
+            
+            if (link) {
+              const href = link.getAttribute('href') || '';
+              const idMatch = href.match(/\/(\d+)(?:$|\/|\?)/);
+              
+              const cells = el.querySelectorAll('td');
+              let name = link.textContent?.trim() || '';
+              let address = '';
+              let city = '';
+              let county = '';
+              let zip = '';
+
+              if (cells.length >= 1) name = cells[0]?.textContent?.trim() || name;
+              if (cells.length >= 2) address = cells[1]?.textContent?.trim() || '';
+              if (cells.length >= 3) city = cells[2]?.textContent?.trim() || '';
+              if (cells.length >= 4) county = cells[3]?.textContent?.trim() || '';
+              if (cells.length >= 5) zip = cells[4]?.textContent?.trim() || '';
+
+              if (idMatch || href) {
+                results.push({
+                  id: idMatch ? idMatch[1] : href,
+                  name: name || `Facility ${index + 1}`,
+                  address,
+                  city,
+                  county,
+                  zip,
+                  programs: [],
+                  link: href.startsWith('http') ? href : `https://webapps.illinois.gov${href}`,
+                });
+              }
+            }
+          });
           
-          let name = link.textContent?.trim() || '';
-          let address = '';
-          let city = '';
-          let county = '';
-          let zip = '';
-          let programs: string[] = [];
-
-          if (cells && cells.length >= 4) {
-            name = cells[0]?.textContent?.trim() || name;
-            address = cells[1]?.textContent?.trim() || '';
-            city = cells[2]?.textContent?.trim() || '';
-            county = cells[3]?.textContent?.trim() || '';
-            if (cells[4]) zip = cells[4]?.textContent?.trim() || '';
-          }
-
-          // Look for program badges
-          const badges = row?.querySelectorAll('.badge, .program, [class*="program"]');
-          badges?.forEach(b => {
-            const text = b.textContent?.trim();
-            if (text) programs.push(text);
-          });
-
-          results.push({
-            id: idMatch[1],
-            name,
-            address,
-            city,
-            county,
-            zip,
-            programs,
-            link: href,
-          });
+          if (results.length > 0) break;
         }
-      });
+      }
 
       return results;
     });
@@ -160,42 +217,34 @@ export class IEPAScraper {
     return facilities;
   }
 
-  /**
-   * Get all documents for a facility
-   */
   async getFacilityDocuments(facilityId: string): Promise<DocumentInfo[]> {
     if (!this.page) throw new Error('Browser not initialized');
 
     console.log(`Getting documents for facility: ${facilityId}`);
 
     // Navigate to facility page
-    await this.page.goto(`https://webapps.illinois.gov/EPA/DocumentExplorer/Facility/${facilityId}`, {
+    const url = facilityId.startsWith('http') 
+      ? facilityId 
+      : `https://webapps.illinois.gov/EPA/DocumentExplorer/Documents/Index/${facilityId}`;
+    
+    await this.page.goto(url, {
       waitUntil: 'networkidle',
-      timeout: 30000,
+      timeout: 60000,
     });
 
-    // Wait for page to load
-    await this.page.waitForTimeout(2000);
+    await this.page.waitForTimeout(3000);
 
-    // Look for and click "Imaged Documents" or similar expandable sections
-    const expandButtons = await this.page.$$('button:has-text("Imaged"), a:has-text("Imaged"), [data-toggle]:has-text("Document")');
-    for (const button of expandButtons) {
+    // Try to expand all document sections
+    const expandButtons = await this.page.$$('button, a, [data-toggle], .expand, .collapse-toggle');
+    for (const button of expandButtons.slice(0, 10)) {
       try {
-        await button.click();
-        await this.page.waitForTimeout(1000);
-      } catch {
-        // Button may not be clickable
-      }
-    }
-
-    // Also try clicking any accordion/collapsible elements
-    const accordions = await this.page.$$('.accordion-header, .collapse-toggle, [data-bs-toggle="collapse"]');
-    for (const acc of accordions) {
-      try {
-        await acc.click();
-        await this.page.waitForTimeout(500);
-      } catch {
-        // May not be clickable
+        const text = await button.textContent();
+        if (text && (text.includes('expand') || text.includes('show') || text.includes('+'))) {
+          await button.click();
+          await this.page.waitForTimeout(500);
+        }
+      } catch (e) {
+        continue;
       }
     }
 
@@ -203,211 +252,58 @@ export class IEPAScraper {
 
     // Extract document information
     const documents = await this.page.evaluate(() => {
-      const docs: DocumentInfo[] = [];
+      const docs: any[] = [];
       
-      // Look for document links - they typically link to DocuWare or have PDF in the URL
-      const docLinks = document.querySelectorAll('a[href*="DocuWare"], a[href*=".pdf"], a[href*="Document"], table a');
-      
-      docLinks.forEach((link, index) => {
-        const href = link.getAttribute('href') || '';
-        const row = link.closest('tr');
-        const cells = row?.querySelectorAll('td');
-        
-        let type = '';
-        let date = '';
-        let description = link.textContent?.trim() || '';
-        let category = '';
+      // Look for document links
+      const linkSelectors = [
+        'a[href*="DocuWare"]',
+        'a[href*=".pdf"]',
+        'a[href*="Document"]',
+        'a[href*="ViewDocument"]',
+        '.document-link',
+        'table a'
+      ];
 
-        if (cells && cells.length >= 2) {
-          // Try to extract from table cells
-          const cellTexts = Array.from(cells).map(c => c.textContent?.trim() || '');
+      const seenUrls = new Set();
+
+      for (const selector of linkSelectors) {
+        const links = document.querySelectorAll(selector);
+        links.forEach((link, index) => {
+          const href = link.getAttribute('href') || '';
+          if (seenUrls.has(href)) return;
+          seenUrls.add(href);
+
+          const row = link.closest('tr') || link.closest('div') || link.parentElement;
+          const cells = row?.querySelectorAll('td') || [];
           
-          // Look for date pattern (MM/DD/YYYY)
-          cellTexts.forEach(text => {
-            if (/\d{1,2}\/\d{1,2}\/\d{4}/.test(text)) {
-              date = text;
+          let type = link.textContent?.trim() || 'Document';
+          let date = '';
+          let category = '';
+          let description = type;
+
+          // Try to extract info from table cells
+          if (cells.length >= 1) type = cells[0]?.textContent?.trim() || type;
+          if (cells.length >= 2) {
+            const cell2 = cells[1]?.textContent?.trim() || '';
+            if (/\d{1,2}\/\d{1,2}\/\d{4}/.test(cell2)) {
+              date = cell2;
+            } else {
+              category = cell2;
             }
-          });
-          
-          type = cellTexts[0] || '';
-          if (cellTexts.length > 2) {
-            category = cellTexts[1] || '';
           }
-        }
-
-        // Only add if it looks like a document link
-        if (href && (href.includes('DocuWare') || href.includes('.pdf') || href.includes('Document'))) {
-          docs.push({
-            id: `doc-${index}`,
-            type: type || 'Unknown',
-            date: date || 'Unknown',
-            category: category || 'Imaged Document',
-            description: description || 'Document',
-            viewerUrl: href.startsWith('http') ? href : `https://webapps.illinois.gov${href}`,
-          });
-        }
-      });
-
-      return docs;
-    });
-
-    console.log(`Found ${documents.length} documents`);
-    return documents;
-  }
-
-  /**
-   * Download a document PDF
-   */
-  async downloadDocument(doc: DocumentInfo): Promise<DownloadedDocument | null> {
-    if (!this.page || !this.context) throw new Error('Browser not initialized');
-
-    console.log(`Downloading document: ${doc.description} (${doc.date})`);
-
-    try {
-      // Navigate to the document viewer URL
-      if (!doc.viewerUrl) {
-        console.log('No viewer URL for document');
-        return null;
-      }
-
-      // Create a new page for downloading to avoid disrupting main navigation
-      const downloadPage = await this.context.newPage();
-      
-      try {
-        // Set up download handling
-        const downloadPromise = downloadPage.waitForEvent('download', { timeout: 30000 }).catch(() => null);
-        
-        // Navigate to document
-        await downloadPage.goto(doc.viewerUrl, {
-          waitUntil: 'networkidle',
-          timeout: 30000,
-        });
-
-        // Wait a moment for any redirects
-        await downloadPage.waitForTimeout(2000);
-
-        // Check if we're on a DocuWare viewer page
-        const currentUrl = downloadPage.url();
-        
-        if (currentUrl.includes('DocuWare')) {
-          // Look for download button or PDF link
-          const downloadBtn = await downloadPage.$('a[href*=".pdf"], button:has-text("Download"), a:has-text("Download"), [class*="download"]');
-          
-          if (downloadBtn) {
-            const newDownloadPromise = downloadPage.waitForEvent('download', { timeout: 30000 }).catch(() => null);
-            await downloadBtn.click();
-            
-            const download = await newDownloadPromise;
-            if (download) {
-              const buffer = await download.path().then(p => {
-                const fs = require('fs');
-                return fs.readFileSync(p);
-              });
-              
-              await downloadPage.close();
-              
-              return {
-                ...doc,
-                pdfBuffer: buffer,
-                filename: download.suggestedFilename(),
-              };
+          if (cells.length >= 3) {
+            const cell3 = cells[2]?.textContent?.trim() || '';
+            if (/\d{1,2}\/\d{1,2}\/\d{4}/.test(cell3)) {
+              date = cell3;
             }
           }
 
-          // Try to find iframe with PDF
-          const pdfFrame = downloadPage.frameLocator('iframe[src*=".pdf"], iframe[src*="DocuWare"]');
-          const frameSrc = await downloadPage.$eval('iframe', (el) => el.src).catch(() => null);
-          
-          if (frameSrc && frameSrc.includes('.pdf')) {
-            const response = await downloadPage.request.get(frameSrc);
-            const buffer = await response.body();
-            
-            await downloadPage.close();
-            
-            return {
-              ...doc,
-              pdfBuffer: buffer,
-              filename: `${doc.type}_${doc.date.replace(/\//g, '-')}.pdf`,
-            };
+          // Look for date patterns in nearby text
+          if (!date) {
+            const rowText = row?.textContent || '';
+            const dateMatch = rowText.match(/\d{1,2}\/\d{1,2}\/\d{4}/);
+            if (dateMatch) date = dateMatch[0];
           }
-        }
 
-        // Direct PDF URL
-        if (currentUrl.endsWith('.pdf') || currentUrl.includes('.pdf')) {
-          const response = await downloadPage.request.get(currentUrl);
-          const buffer = await response.body();
-          
-          await downloadPage.close();
-          
-          return {
-            ...doc,
-            pdfBuffer: buffer,
-            filename: `${doc.type}_${doc.date.replace(/\//g, '-')}.pdf`,
-          };
-        }
-
-        // Check if a download was triggered
-        const download = await downloadPromise;
-        if (download) {
-          const buffer = await download.path().then(p => {
-            const fs = require('fs');
-            return fs.readFileSync(p);
-          });
-          
-          await downloadPage.close();
-          
-          return {
-            ...doc,
-            pdfBuffer: buffer,
-            filename: download.suggestedFilename(),
-          };
-        }
-
-        console.log(`Could not download document from: ${currentUrl}`);
-        await downloadPage.close();
-        return null;
-
-      } catch (error) {
-        console.error(`Error downloading document: ${error}`);
-        await downloadPage.close();
-        return null;
-      }
-
-    } catch (error) {
-      console.error(`Download error for ${doc.description}:`, error);
-      return null;
-    }
-  }
-
-  /**
-   * Close the browser
-   */
-  async close(): Promise<void> {
-    if (this.browser) {
-      await this.browser.close();
-      this.browser = null;
-      this.context = null;
-      this.page = null;
-      this.isInitialized = false;
-      console.log('Browser closed');
-    }
-  }
-}
-
-// Singleton instance for reuse
-let scraperInstance: IEPAScraper | null = null;
-
-export async function getScraper(): Promise<IEPAScraper> {
-  if (!scraperInstance) {
-    scraperInstance = new IEPAScraper();
-    await scraperInstance.init();
-  }
-  return scraperInstance;
-}
-
-export async function closeScraper(): Promise<void> {
-  if (scraperInstance) {
-    await scraperInstance.close();
-    scraperInstance = null;
-  }
-}
+          if (href) {
+            docs.push({
