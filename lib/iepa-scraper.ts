@@ -1,6 +1,6 @@
 /**
- * IEPA Document Explorer Scraper
- * Uses Playwright to automate searching and downloading documents
+ * IEPA Document Explorer Scraper v2
+ * Enhanced DocuWare PDF download support
  */
 
 import { chromium, Browser, Page, BrowserContext } from 'playwright';
@@ -48,12 +48,15 @@ export class IEPAScraper {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
+        '--disable-web-security',
+        '--allow-running-insecure-content',
       ],
     });
 
     this.context = await this.browser.newContext({
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       viewport: { width: 1920, height: 1080 },
+      acceptDownloads: true,
     });
 
     this.page = await this.context.newPage();
@@ -66,19 +69,14 @@ export class IEPAScraper {
 
     console.log(`Searching for facilities: "${query}"`);
 
-    // Navigate to the attribute search page
     await this.page.goto('https://webapps.illinois.gov/EPA/DocumentExplorer/Attributes', {
       waitUntil: 'networkidle',
       timeout: 60000,
     });
 
-    // Wait for page to fully load
     await this.page.waitForTimeout(3000);
-
-    // Take screenshot for debugging
     console.log('Page loaded, looking for search form...');
 
-    // Try to find and fill the Name field using various selectors
     const nameSelectors = [
       '#Name',
       'input[name="Name"]',
@@ -104,7 +102,6 @@ export class IEPAScraper {
     }
 
     if (!filled) {
-      // Try filling any visible text input
       const inputs = await this.page.$$('input[type="text"]:visible');
       if (inputs.length > 0) {
         await inputs[0].fill(query.trim());
@@ -117,7 +114,6 @@ export class IEPAScraper {
       throw new Error('Could not find search input field');
     }
 
-    // Find and click the search button
     const buttonSelectors = [
       'button[type="submit"]',
       'input[type="submit"]',
@@ -143,33 +139,29 @@ export class IEPAScraper {
     }
 
     if (!clicked) {
-      // Try pressing Enter instead
       await this.page.keyboard.press('Enter');
       console.log('Pressed Enter to submit');
     }
 
-    // Wait for results to load
     await this.page.waitForLoadState('networkidle');
     await this.page.waitForTimeout(3000);
 
-    // Extract facility results
     const facilities = await this.page.evaluate(() => {
       const results: any[] = [];
       
-      // Try multiple selectors for result rows
       const selectors = [
         'table tbody tr',
         '.search-results tr',
         '.facility-item',
         '[data-facility-id]',
-        'a[href*="/Facility/"]'
+        'a[href*="/Facility/"]',
+        'a[href*="/Documents/"]'
       ];
 
       for (const selector of selectors) {
         const elements = document.querySelectorAll(selector);
         if (elements.length > 0) {
           elements.forEach((el, index) => {
-            // Try to find facility link
             const link = el.querySelector('a[href*="Facility"]') || 
                         el.querySelector('a[href*="Documents"]') ||
                         (el.tagName === 'A' ? el : null);
@@ -222,7 +214,6 @@ export class IEPAScraper {
 
     console.log(`Getting documents for facility: ${facilityId}`);
 
-    // Navigate to facility page
     const url = facilityId.startsWith('http') 
       ? facilityId 
       : `https://webapps.illinois.gov/EPA/DocumentExplorer/Documents/Index/${facilityId}`;
@@ -234,202 +225,313 @@ export class IEPAScraper {
 
     await this.page.waitForTimeout(3000);
 
-    // Try to expand all document sections
-    const expandButtons = await this.page.$$('button, a, [data-toggle], .expand, .collapse-toggle');
-    for (const button of expandButtons.slice(0, 10)) {
+    // Click on document category links to open DocuWare
+    const categoryLinks = await this.page.$$('a[href*="docuware"], a[href*="DocuWare"], a.document-link, td a');
+    
+    const documents: DocumentInfo[] = [];
+    
+    for (let i = 0; i < categoryLinks.length && i < 5; i++) {
       try {
-        const text = await button.textContent();
-        if (text && (text.includes('expand') || text.includes('show') || text.includes('+'))) {
-          await button.click();
-          await this.page.waitForTimeout(500);
+        const linkText = await categoryLinks[i].textContent();
+        const href = await categoryLinks[i].getAttribute('href');
+        
+        if (href && (href.includes('docuware') || href.includes('DocuWare'))) {
+          console.log(`Found DocuWare link: ${linkText}`);
+          
+          // Open DocuWare in new page
+          const docuwarePage = await this.context!.newPage();
+          await docuwarePage.goto(href, { waitUntil: 'networkidle', timeout: 30000 });
+          await docuwarePage.waitForTimeout(3000);
+          
+          // Extract documents from DocuWare grid
+          const docuwareDocs = await docuwarePage.evaluate(() => {
+            const docs: any[] = [];
+            
+            // Look for table rows in DocuWare
+            const rows = document.querySelectorAll('table tbody tr, .result-row, [class*="row"]');
+            
+            rows.forEach((row, idx) => {
+              const cells = row.querySelectorAll('td');
+              if (cells.length >= 3) {
+                const type = cells[0]?.textContent?.trim() || 'Document';
+                const bureauId = cells[1]?.textContent?.trim() || '';
+                const siteName = cells[2]?.textContent?.trim() || '';
+                const date = cells[3]?.textContent?.trim() || '';
+                
+                docs.push({
+                  id: `docuware-${idx}`,
+                  type: type,
+                  date: date,
+                  category: 'DocuWare',
+                  description: `${siteName} - ${bureauId}`,
+                  rowIndex: idx
+                });
+              }
+            });
+            
+            return docs;
+          });
+          
+          // Store the DocuWare page URL for later
+          const docuwareUrl = docuwarePage.url();
+          
+          docuwareDocs.forEach((doc: any) => {
+            documents.push({
+              ...doc,
+              viewerUrl: docuwareUrl,
+            });
+          });
+          
+          await docuwarePage.close();
         }
       } catch (e) {
-        continue;
+        console.log(`Error processing link ${i}:`, e);
       }
     }
 
-    await this.page.waitForTimeout(2000);
-
-    // Extract document information
-    const documents = await this.page.evaluate(() => {
-      const docs: any[] = [];
-      
-      // Look for document links
-      const linkSelectors = [
-        'a[href*="DocuWare"]',
-        'a[href*=".pdf"]',
-        'a[href*="Document"]',
-        'a[href*="ViewDocument"]',
-        '.document-link',
-        'table a'
-      ];
-
-      const seenUrls = new Set();
-
-      for (const selector of linkSelectors) {
-        const links = document.querySelectorAll(selector);
-        links.forEach((link, index) => {
+    // If no DocuWare docs found, try to get docs from main page
+    if (documents.length === 0) {
+      const pageDocs = await this.page.evaluate(() => {
+        const docs: any[] = [];
+        const links = document.querySelectorAll('a');
+        
+        links.forEach((link, idx) => {
           const href = link.getAttribute('href') || '';
-          if (seenUrls.has(href)) return;
-          seenUrls.add(href);
-
-          const row = link.closest('tr') || link.closest('div') || link.parentElement;
-          const cells = row?.querySelectorAll('td') || [];
+          const text = link.textContent?.trim() || '';
           
-          let type = link.textContent?.trim() || 'Document';
-          let date = '';
-          let category = '';
-          let description = type;
-
-          // Try to extract info from table cells
-          if (cells.length >= 1) type = cells[0]?.textContent?.trim() || type;
-          if (cells.length >= 2) {
-            const cell2 = cells[1]?.textContent?.trim() || '';
-            if (/\d{1,2}\/\d{1,2}\/\d{4}/.test(cell2)) {
-              date = cell2;
-            } else {
-              category = cell2;
-            }
-          }
-          if (cells.length >= 3) {
-            const cell3 = cells[2]?.textContent?.trim() || '';
-            if (/\d{1,2}\/\d{1,2}\/\d{4}/.test(cell3)) {
-              date = cell3;
-            }
-          }
-
-          // Look for date patterns in nearby text
-          if (!date) {
-            const rowText = row?.textContent || '';
-            const dateMatch = rowText.match(/\d{1,2}\/\d{1,2}\/\d{4}/);
-            if (dateMatch) date = dateMatch[0];
-          }
-
-          if (href) {
+          if (href.includes('docuware') || href.includes('DocuWare') || 
+              text.toLowerCase().includes('technical') || 
+              text.toLowerCase().includes('document')) {
             docs.push({
-              id: `doc-${index}`,
-              type: type.substring(0, 100),
-              date: date || 'Unknown',
-              category: category || 'Document',
-              description: description.substring(0, 200),
+              id: `doc-${idx}`,
+              type: text.substring(0, 50) || 'Document',
+              date: 'Unknown',
+              category: 'IEPA Document',
+              description: text,
               viewerUrl: href.startsWith('http') ? href : `https://webapps.illinois.gov${href}`,
             });
           }
         });
-      }
-
-      return docs;
-    });
+        
+        return docs;
+      });
+      
+      documents.push(...pageDocs);
+    }
 
     console.log(`Found ${documents.length} documents`);
     return documents;
   }
 
   async downloadDocument(doc: DocumentInfo): Promise<DownloadedDocument | null> {
-    if (!this.page || !this.context) throw new Error('Browser not initialized');
+    if (!this.context) throw new Error('Browser not initialized');
 
-    console.log(`Downloading: ${doc.type} (${doc.date})`);
+    console.log(`Attempting download: ${doc.type} (${doc.date})`);
 
     try {
-      if (!doc.viewerUrl) return null;
+      if (!doc.viewerUrl) {
+        console.log('No viewer URL');
+        return null;
+      }
 
       const downloadPage = await this.context.newPage();
       
       try {
-        // Set up download handling
-        const downloadPromise = downloadPage.waitForEvent('download', { timeout: 30000 }).catch(() => null);
-        
+        // Go to DocuWare URL
         await downloadPage.goto(doc.viewerUrl, {
           waitUntil: 'networkidle',
-          timeout: 30000,
+          timeout: 45000,
         });
-
-        await downloadPage.waitForTimeout(2000);
-
-        // Check if we got a PDF directly
-        const currentUrl = downloadPage.url();
         
-        // Try to get PDF content directly via fetch
-        try {
-          const response = await downloadPage.request.get(doc.viewerUrl);
-          const contentType = response.headers()['content-type'] || '';
+        await downloadPage.waitForTimeout(3000);
+        
+        console.log(`Opened page: ${downloadPage.url()}`);
+
+        // If this is a DocuWare results page, click on specific document row
+        if (doc.id.startsWith('docuware-')) {
+          const rowIndex = parseInt(doc.id.replace('docuware-', ''));
           
-          if (contentType.includes('pdf')) {
-            const buffer = await response.body();
-            await downloadPage.close();
+          // Click on the row to select it
+          const rows = await downloadPage.$$('table tbody tr');
+          if (rows[rowIndex]) {
+            await rows[rowIndex].click();
+            await downloadPage.waitForTimeout(2000);
+          }
+        }
+
+        // Method 1: Look for download button
+        const downloadButtons = [
+          'button:has-text("Download")',
+          'a:has-text("Download")',
+          '[title*="Download"]',
+          '[class*="download"]',
+          'button[class*="pdf"]',
+          'a[href*=".pdf"]',
+        ];
+
+        for (const selector of downloadButtons) {
+          try {
+            const btn = await downloadPage.$(selector);
+            if (btn) {
+              console.log(`Found download button: ${selector}`);
+              
+              // Set up download listener
+              const downloadPromise = downloadPage.waitForEvent('download', { timeout: 15000 });
+              await btn.click();
+              
+              try {
+                const download = await downloadPromise;
+                const filePath = await download.path();
+                if (filePath) {
+                  const fs = require('fs');
+                  const buffer = fs.readFileSync(filePath);
+                  await downloadPage.close();
+                  
+                  console.log(`Downloaded via button: ${download.suggestedFilename()}`);
+                  return {
+                    ...doc,
+                    pdfBuffer: buffer,
+                    filename: download.suggestedFilename(),
+                  };
+                }
+              } catch (e) {
+                console.log('Download event timed out, trying next method...');
+              }
+            }
+          } catch (e) {
+            continue;
+          }
+        }
+
+        // Method 2: Right-click context menu
+        try {
+          const docIcon = await downloadPage.$('.document-icon, [class*="doc-icon"], table tbody tr:first-child');
+          if (docIcon) {
+            await docIcon.click({ button: 'right' });
+            await downloadPage.waitForTimeout(1000);
             
-            return {
-              ...doc,
-              pdfBuffer: buffer,
-              filename: `${doc.type}_${doc.date.replace(/\//g, '-')}.pdf`,
-            };
+            const contextDownload = await downloadPage.$('text=Download, text=Save, [class*="download"]');
+            if (contextDownload) {
+              const downloadPromise = downloadPage.waitForEvent('download', { timeout: 15000 });
+              await contextDownload.click();
+              
+              try {
+                const download = await downloadPromise;
+                const filePath = await download.path();
+                if (filePath) {
+                  const fs = require('fs');
+                  const buffer = fs.readFileSync(filePath);
+                  await downloadPage.close();
+                  
+                  console.log(`Downloaded via context menu`);
+                  return {
+                    ...doc,
+                    pdfBuffer: buffer,
+                    filename: download.suggestedFilename(),
+                  };
+                }
+              } catch (e) {
+                console.log('Context menu download failed');
+              }
+            }
           }
         } catch (e) {
-          console.log('Direct fetch failed, trying browser download...');
+          console.log('Context menu method failed');
         }
 
-        // Look for PDF viewer iframe or download button
-        const pdfFrame = await downloadPage.$('iframe[src*=".pdf"], iframe[src*="DocuWare"]');
-        if (pdfFrame) {
-          const frameSrc = await pdfFrame.getAttribute('src');
-          if (frameSrc) {
-            const response = await downloadPage.request.get(frameSrc);
-            const buffer = await response.body();
-            await downloadPage.close();
-            
-            return {
-              ...doc,
-              pdfBuffer: buffer,
-              filename: `${doc.type}_${doc.date.replace(/\//g, '-')}.pdf`,
-            };
+        // Method 3: Look for iframe with PDF
+        try {
+          const iframe = await downloadPage.$('iframe[src*=".pdf"], iframe[src*="viewer"], iframe[src*="DocuWare"]');
+          if (iframe) {
+            const src = await iframe.getAttribute('src');
+            if (src) {
+              console.log(`Found iframe: ${src}`);
+              const response = await downloadPage.request.get(src);
+              const buffer = await response.body();
+              
+              // Check if it's a PDF
+              if (buffer[0] === 0x25 && buffer[1] === 0x50) { // %P
+                await downloadPage.close();
+                console.log('Downloaded from iframe');
+                return {
+                  ...doc,
+                  pdfBuffer: buffer,
+                  filename: `${doc.type.replace(/[^a-z0-9]/gi, '_')}_${doc.date.replace(/\//g, '-')}.pdf`,
+                };
+              }
+            }
           }
+        } catch (e) {
+          console.log('Iframe method failed');
         }
 
-        // Try clicking download button
-        const downloadBtn = await downloadPage.$('a[href*=".pdf"], button:has-text("Download"), a:has-text("Download")');
-        if (downloadBtn) {
-          const href = await downloadBtn.getAttribute('href');
-          if (href && href.includes('.pdf')) {
-            const response = await downloadPage.request.get(href);
-            const buffer = await response.body();
-            await downloadPage.close();
-            
-            return {
-              ...doc,
-              pdfBuffer: buffer,
-              filename: `${doc.type}_${doc.date.replace(/\//g, '-')}.pdf`,
-            };
+        // Method 4: Check for direct PDF link
+        try {
+          const pdfLinks = await downloadPage.$$('a[href$=".pdf"], a[href*="GetDocument"], a[href*="Download"]');
+          for (const link of pdfLinks) {
+            const href = await link.getAttribute('href');
+            if (href) {
+              console.log(`Trying direct link: ${href}`);
+              const fullUrl = href.startsWith('http') ? href : `https://docuware7.illinois.gov${href}`;
+              
+              try {
+                const response = await downloadPage.request.get(fullUrl);
+                const buffer = await response.body();
+                
+                if (buffer.length > 1000 && buffer[0] === 0x25) {
+                  await downloadPage.close();
+                  console.log('Downloaded from direct link');
+                  return {
+                    ...doc,
+                    pdfBuffer: buffer,
+                    filename: `${doc.type.replace(/[^a-z0-9]/gi, '_')}.pdf`,
+                  };
+                }
+              } catch (e) {
+                continue;
+              }
+            }
           }
+        } catch (e) {
+          console.log('Direct link method failed');
         }
 
-        // Check for download event
-        const download = await downloadPromise;
-        if (download) {
-          const path = await download.path();
-          if (path) {
-            const fs = require('fs');
-            const buffer = fs.readFileSync(path);
-            await downloadPage.close();
-            
-            return {
-              ...doc,
-              pdfBuffer: buffer,
-              filename: download.suggestedFilename(),
-            };
+        // Method 5: Use keyboard shortcut
+        try {
+          await downloadPage.keyboard.press('Control+s');
+          await downloadPage.waitForTimeout(2000);
+          
+          const download = await downloadPage.waitForEvent('download', { timeout: 5000 }).catch(() => null);
+          if (download) {
+            const filePath = await download.path();
+            if (filePath) {
+              const fs = require('fs');
+              const buffer = fs.readFileSync(filePath);
+              await downloadPage.close();
+              
+              return {
+                ...doc,
+                pdfBuffer: buffer,
+                filename: download.suggestedFilename(),
+              };
+            }
           }
+        } catch (e) {
+          console.log('Keyboard shortcut failed');
         }
 
         await downloadPage.close();
+        console.log('All download methods failed');
         return null;
 
       } catch (error) {
-        console.error(`Download error: ${error}`);
+        console.error(`Download page error: ${error}`);
         await downloadPage.close();
         return null;
       }
 
     } catch (error) {
-      console.error(`Download error for ${doc.type}:`, error);
+      console.error(`Download error: ${error}`);
       return null;
     }
   }
