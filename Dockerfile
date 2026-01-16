@@ -37,10 +37,9 @@ RUN apt-get update && apt-get install -y \
 FROM base AS deps
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
 
 # Install dependencies including Playwright
-RUN npm ci
+RUN npm install
 
 # Install Playwright browsers
 RUN npx playwright install chromium
