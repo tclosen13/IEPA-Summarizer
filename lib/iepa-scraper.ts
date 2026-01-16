@@ -1,6 +1,6 @@
 /**
- * IEPA Document Explorer Scraper v5
- * Fixed DocuWare link detection
+ * IEPA Document Explorer Scraper v6
+ * Better DocuWare table row detection
  */
 
 import { chromium, Browser, Page, BrowserContext } from 'playwright';
@@ -40,7 +40,6 @@ export class IEPAScraper {
 
   async init(): Promise<void> {
     if (this.isInitialized) return;
-
     console.log('Initializing browser...');
     
     this.browser = await chromium.launch({
@@ -60,12 +59,10 @@ export class IEPAScraper {
 
   async searchFacilities(query: string): Promise<FacilityResult[]> {
     if (!this.page) throw new Error('Not initialized');
-
     console.log(`Searching: "${query}"`);
 
     await this.page.goto('https://webapps.illinois.gov/EPA/DocumentExplorer/Attributes', {
-      waitUntil: 'networkidle',
-      timeout: 60000,
+      waitUntil: 'networkidle', timeout: 60000,
     });
     await this.page.waitForTimeout(3000);
 
@@ -112,24 +109,8 @@ export class IEPAScraper {
     await this.page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
     await this.page.waitForTimeout(3000);
 
-    // Find DocuWare links - they can be in different places
-    // Look for links that contain "docuware" in href OR links in the "Imaged Documents" section
+    // Find DocuWare link
     const docuwareHref = await this.page.evaluate(() => {
-      // Method 1: Direct docuware links
-      const directLink = document.querySelector('a[href*="docuware" i]');
-      if (directLink) return directLink.getAttribute('href');
-
-      // Method 2: Links in Imaged Documents section (like "Leaking UST Technical")
-      const imagedSection = document.querySelector('h3:contains("Imaged"), h4:contains("Imaged"), *:contains("Imaged Documents")');
-      if (imagedSection) {
-        const parent = imagedSection.closest('div, section, table');
-        if (parent) {
-          const link = parent.querySelector('a[href*="docuware" i]');
-          if (link) return link.getAttribute('href');
-        }
-      }
-
-      // Method 3: Any link that looks like it goes to DocuWare
       const allLinks = document.querySelectorAll('a');
       for (const link of allLinks) {
         const href = link.getAttribute('href') || '';
@@ -137,33 +118,11 @@ export class IEPAScraper {
           return href;
         }
       }
-
-      // Method 4: Links with text containing "Technical", "UST", "LUST", etc.
-      for (const link of allLinks) {
-        const text = link.textContent?.toLowerCase() || '';
-        const href = link.getAttribute('href') || '';
-        if ((text.includes('technical') || text.includes('ust') || text.includes('lust') || 
-             text.includes('remediation') || text.includes('leaking')) && 
-            href.includes('docuware')) {
-          return href;
-        }
-      }
-
       return null;
     });
 
     if (!docuwareHref) {
-      console.log('No DocuWare link found on page');
-      
-      // Debug: print all links on page
-      const allLinks = await this.page.evaluate(() => {
-        return Array.from(document.querySelectorAll('a')).map(a => ({
-          text: a.textContent?.trim().substring(0, 50),
-          href: a.getAttribute('href')?.substring(0, 100)
-        }));
-      });
-      console.log('Links found on page:', JSON.stringify(allLinks.slice(0, 20), null, 2));
-      
+      console.log('No DocuWare link found');
       return [];
     }
 
@@ -172,31 +131,98 @@ export class IEPAScraper {
 
     // Open DocuWare
     await this.page.goto(this.docuwareUrl, { waitUntil: 'networkidle', timeout: 60000 });
-    await this.page.waitForTimeout(5000);
+    
+    // Wait longer for DocuWare to fully load its dynamic content
+    console.log('Waiting for DocuWare to load...');
+    await this.page.waitForTimeout(8000);
 
-    console.log(`DocuWare page loaded: ${this.page.url()}`);
+    // Try to wait for table rows to appear
+    try {
+      await this.page.waitForSelector('tr, [class*="Row"], [class*="row"]', { timeout: 10000 });
+      console.log('Found row elements');
+    } catch (e) {
+      console.log('No row elements found after waiting');
+    }
 
-    // Get document list from DocuWare
+    // Debug: Log page content structure
+    const pageInfo = await this.page.evaluate(() => {
+      const info: any = {
+        title: document.title,
+        bodyClasses: document.body.className,
+        tables: document.querySelectorAll('table').length,
+        trs: document.querySelectorAll('tr').length,
+        divs: document.querySelectorAll('div').length,
+      };
+      
+      // Find any element that might contain document data
+      const possibleContainers = document.querySelectorAll('[class*="result"], [class*="Result"], [class*="list"], [class*="List"], [class*="grid"], [class*="Grid"], table');
+      info.containers = Array.from(possibleContainers).map(c => ({
+        tag: c.tagName,
+        class: c.className?.substring?.(0, 100),
+        children: c.children.length
+      }));
+
+      // Get all text content that looks like dates (document indicators)
+      const allText = document.body.innerText;
+      const dateMatches = allText.match(/\d{1,2}\/\d{1,2}\/\d{4}/g) || [];
+      info.datesFound = dateMatches.slice(0, 10);
+
+      return info;
+    });
+
+    console.log('Page info:', JSON.stringify(pageInfo, null, 2));
+
+    // Get documents using multiple selector strategies
     const documents = await this.page.evaluate(() => {
       const docs: any[] = [];
       
-      // DocuWare uses various table/grid structures
-      const rows = document.querySelectorAll(
-        'table tbody tr, ' +
-        '[class*="ResultList"] tr, ' +
-        '[class*="result"] tr, ' +
-        '[class*="Row"]:not([class*="Header"]), ' +
-        '[role="row"]'
-      );
+      // Strategy 1: Standard table rows
+      let rows = document.querySelectorAll('table tbody tr');
+      console.log(`Strategy 1 (table tbody tr): ${rows.length} rows`);
       
-      console.log(`Found ${rows.length} rows in DocuWare`);
+      // Strategy 2: Any tr elements
+      if (rows.length === 0) {
+        rows = document.querySelectorAll('tr');
+        console.log(`Strategy 2 (tr): ${rows.length} rows`);
+      }
       
+      // Strategy 3: Div-based rows (some grids use divs)
+      if (rows.length <= 1) {
+        rows = document.querySelectorAll('[class*="Row"]:not([class*="Header"]), [class*="row"]:not([class*="header"]), [role="row"]');
+        console.log(`Strategy 3 (div rows): ${rows.length} rows`);
+      }
+
+      // Strategy 4: Look for elements containing dates
+      if (rows.length <= 1) {
+        const allElements = document.querySelectorAll('*');
+        const rowLike: Element[] = [];
+        allElements.forEach(el => {
+          const text = el.textContent || '';
+          if (/\d{1,2}\/\d{1,2}\/\d{4}/.test(text) && el.children.length >= 2) {
+            // Check if this is a "row-like" element (has multiple columns/cells)
+            const childCount = el.children.length;
+            if (childCount >= 3 && childCount <= 15) {
+              rowLike.push(el);
+            }
+          }
+        });
+        if (rowLike.length > 0) {
+          rows = rowLike as any;
+          console.log(`Strategy 4 (date containers): ${rows.length} rows`);
+        }
+      }
+
       rows.forEach((row, idx) => {
-        const cells = row.querySelectorAll('td, [class*="Cell"], [role="cell"]');
+        // Skip header rows
+        if (row.querySelector('th') || row.className?.toLowerCase().includes('header')) {
+          return;
+        }
+
+        const cells = row.querySelectorAll('td, [class*="Cell"], [class*="cell"], > div, > span');
         if (cells.length >= 2) {
           const texts = Array.from(cells).map(c => c.textContent?.trim() || '');
           
-          // Find date pattern
+          // Find date
           let date = '';
           for (const text of texts) {
             const dateMatch = text.match(/\d{1,2}\/\d{1,2}\/\d{4}/);
@@ -205,23 +231,18 @@ export class IEPAScraper {
               break;
             }
           }
-          
-          // Get document type from first column (usually has an icon)
-          const typeCell = cells[0];
-          let type = typeCell?.textContent?.trim() || 'Document';
-          if (type.length < 2) type = 'Document'; // If it's just an icon
-          
-          // Get site name (usually column 2 or 3)
-          const siteName = texts[2] || texts[1] || '';
-          
-          docs.push({
-            id: `dw-${idx}`,
-            type: type,
-            date: date || texts.find(t => t.includes('/')) || 'Unknown',
-            category: 'LUST Technical',
-            description: siteName,
-            rowIndex: idx,
-          });
+
+          // Only add if we found meaningful data
+          if (date || texts.some(t => t.length > 3)) {
+            docs.push({
+              id: `dw-${idx}`,
+              type: texts[0] || 'Document',
+              date: date || 'Unknown',
+              category: 'LUST Technical',
+              description: texts.slice(1, 4).filter(t => t).join(' | '),
+              rowIndex: idx,
+            });
+          }
         }
       });
       
@@ -229,6 +250,40 @@ export class IEPAScraper {
     });
 
     console.log(`Found ${documents.length} documents in DocuWare`);
+    
+    // If still no documents, try one more approach - look for clickable document icons
+    if (documents.length === 0) {
+      console.log('Trying icon-based detection...');
+      const iconDocs = await this.page.evaluate(() => {
+        const docs: any[] = [];
+        // DocuWare often uses icons that are clickable
+        const icons = document.querySelectorAll('[class*="icon"], [class*="Icon"], img[src*="doc"], img[src*="pdf"]');
+        icons.forEach((icon, idx) => {
+          const parent = icon.closest('tr, [class*="Row"], [class*="row"]');
+          if (parent) {
+            const text = parent.textContent || '';
+            const dateMatch = text.match(/\d{1,2}\/\d{1,2}\/\d{4}/);
+            if (dateMatch) {
+              docs.push({
+                id: `icon-${idx}`,
+                type: 'Document',
+                date: dateMatch[0],
+                category: 'LUST Technical',
+                description: text.substring(0, 100),
+                rowIndex: idx,
+              });
+            }
+          }
+        });
+        return docs;
+      });
+      
+      if (iconDocs.length > 0) {
+        console.log(`Found ${iconDocs.length} documents via icons`);
+        return iconDocs;
+      }
+    }
+
     return documents;
   }
 
@@ -236,191 +291,125 @@ export class IEPAScraper {
     if (!this.page || !this.context) throw new Error('Not initialized');
 
     const rowIdx = doc.rowIndex ?? 0;
-    console.log(`\n=== Downloading row ${rowIdx}: ${doc.type} (${doc.date}) ===`);
+    console.log(`\n=== Downloading row ${rowIdx}: ${doc.date} ===`);
 
     try {
       // Make sure we're on DocuWare
-      const currentUrl = this.page.url();
-      if (!currentUrl.toLowerCase().includes('docuware') && this.docuwareUrl) {
-        console.log('Navigating back to DocuWare...');
+      if (!this.page.url().toLowerCase().includes('docuware') && this.docuwareUrl) {
         await this.page.goto(this.docuwareUrl, { waitUntil: 'networkidle', timeout: 60000 });
-        await this.page.waitForTimeout(5000);
+        await this.page.waitForTimeout(8000);
       }
 
-      // Get all rows
-      const rows = await this.page.$$('table tbody tr, [class*="Row"]:not([class*="Header"]), [role="row"]');
-      console.log(`Found ${rows.length} rows on page`);
+      // Find all clickable rows
+      const rows = await this.page.$$('tr, [class*="Row"]:not([class*="Header"]), [role="row"]');
+      console.log(`Found ${rows.length} rows`);
       
       if (rowIdx >= rows.length) {
-        console.log(`Row ${rowIdx} not found (only ${rows.length} rows)`);
+        console.log(`Row ${rowIdx} out of range`);
         return null;
       }
 
-      const targetRow = rows[rowIdx];
-
-      // Step 1: Click row to select it
-      console.log('Step 1: Clicking row to select...');
-      await targetRow.click();
+      // Click to select
+      console.log('Clicking row...');
+      await rows[rowIdx].click();
       await this.page.waitForTimeout(2000);
 
-      // Step 2: Try toolbar download button
-      console.log('Step 2: Looking for toolbar download button...');
-      const downloadBtn = await this.page.$('[title*="ownload" i], [class*="download" i], [aria-label*="ownload" i]');
+      // Try double-click to open viewer
+      console.log('Double-clicking to open viewer...');
+      await rows[rowIdx].dblclick();
+      await this.page.waitForTimeout(5000);
+
+      // Check for new pages
+      const pages = this.context.pages();
+      let viewerPage = pages[pages.length - 1];
       
+      if (viewerPage !== this.page) {
+        console.log(`Viewer opened: ${viewerPage.url()}`);
+        await viewerPage.waitForTimeout(3000);
+      }
+
+      // Look for PDF iframe or object
+      const pdfSrc = await viewerPage.evaluate(() => {
+        // Check iframes
+        const iframe = document.querySelector('iframe');
+        if (iframe?.src) return iframe.src;
+        
+        // Check objects
+        const obj = document.querySelector('object');
+        if (obj?.data) return obj.data;
+        
+        // Check embeds
+        const embed = document.querySelector('embed');
+        if (embed?.src) return embed.src;
+
+        // Check for any PDF links
+        const links = document.querySelectorAll('a[href*=".pdf"], a[href*="GetDocument"], a[href*="Download"]');
+        for (const link of links) {
+          const href = link.getAttribute('href');
+          if (href) return href;
+        }
+
+        return null;
+      });
+
+      if (pdfSrc) {
+        console.log(`Found PDF source: ${pdfSrc}`);
+        try {
+          const fullUrl = pdfSrc.startsWith('http') ? pdfSrc : new URL(pdfSrc, viewerPage.url()).href;
+          const response = await viewerPage.request.get(fullUrl);
+          const buffer = await response.body();
+          
+          if (buffer.length > 500 && buffer[0] === 0x25) {
+            console.log(`SUCCESS! Got ${buffer.length} bytes`);
+            if (viewerPage !== this.page) await viewerPage.close();
+            return {
+              ...doc,
+              pdfBuffer: buffer,
+              filename: `document_${doc.date.replace(/\//g, '-')}.pdf`,
+            };
+          }
+        } catch (e) {
+          console.log('PDF fetch error:', e);
+        }
+      }
+
+      // Try download button
+      const downloadBtn = await viewerPage.$('[title*="ownload" i], [class*="download" i], button:has-text("Download")');
       if (downloadBtn) {
-        console.log('Found download button, clicking...');
+        console.log('Clicking download button...');
         try {
           const [download] = await Promise.all([
-            this.page.waitForEvent('download', { timeout: 15000 }),
+            viewerPage.waitForEvent('download', { timeout: 15000 }),
             downloadBtn.click(),
           ]);
-
+          
           if (download) {
-            console.log(`Download started: ${download.suggestedFilename()}`);
             const path = await download.path();
             if (path) {
               const fs = require('fs');
               const buffer = fs.readFileSync(path);
               console.log(`SUCCESS! Downloaded ${buffer.length} bytes`);
-              return {
-                ...doc,
-                pdfBuffer: buffer,
-                filename: download.suggestedFilename() || `${doc.type}.pdf`,
-              };
-            }
-          }
-        } catch (e) {
-          console.log('Toolbar download timed out');
-        }
-      }
-
-      // Step 3: Double-click to open document viewer
-      console.log('Step 3: Double-clicking to open viewer...');
-      await targetRow.dblclick();
-      await this.page.waitForTimeout(5000);
-
-      // Check for new tab/popup
-      const pages = this.context.pages();
-      console.log(`Total pages open: ${pages.length}`);
-      
-      let viewerPage = this.page;
-      if (pages.length > 1) {
-        viewerPage = pages[pages.length - 1];
-        console.log(`Viewer opened in new tab: ${viewerPage.url()}`);
-        await viewerPage.waitForTimeout(3000);
-      }
-
-      // Step 4: Look for PDF in viewer
-      console.log('Step 4: Looking for PDF in viewer...');
-      
-      // Check for iframe
-      const iframe = await viewerPage.$('iframe');
-      if (iframe) {
-        const src = await iframe.getAttribute('src');
-        console.log(`Found iframe with src: ${src}`);
-        
-        if (src && (src.includes('pdf') || src.includes('GetDocument') || src.includes('Viewer'))) {
-          try {
-            const fullUrl = src.startsWith('http') ? src : new URL(src, viewerPage.url()).href;
-            console.log(`Fetching: ${fullUrl}`);
-            const response = await viewerPage.request.get(fullUrl);
-            const buffer = await response.body();
-            
-            console.log(`Got ${buffer.length} bytes, first byte: ${buffer[0]}`);
-            
-            if (buffer.length > 500 && buffer[0] === 0x25) { // %PDF
-              console.log('SUCCESS! Got PDF from iframe');
               if (viewerPage !== this.page) await viewerPage.close();
               return {
                 ...doc,
                 pdfBuffer: buffer,
-                filename: `${doc.type.replace(/[^a-z0-9]/gi, '_')}_${doc.date.replace(/\//g, '-')}.pdf`,
-              };
-            }
-          } catch (e) {
-            console.log('Iframe fetch error:', e);
-          }
-        }
-      }
-
-      // Step 5: Look for download button in viewer
-      console.log('Step 5: Looking for download button in viewer...');
-      const viewerDownloadBtn = await viewerPage.$('[title*="ownload" i], [class*="download" i], button:has-text("Download"), a:has-text("Download")');
-      if (viewerDownloadBtn) {
-        console.log('Found viewer download button');
-        try {
-          const [download] = await Promise.all([
-            viewerPage.waitForEvent('download', { timeout: 15000 }),
-            viewerDownloadBtn.click(),
-          ]);
-
-          if (download) {
-            const path = await download.path();
-            if (path) {
-              const fs = require('fs');
-              const buffer = fs.readFileSync(path);
-              console.log(`SUCCESS! Downloaded ${buffer.length} bytes from viewer`);
-              if (viewerPage !== this.page) await viewerPage.close();
-              return {
-                ...doc,
-                pdfBuffer: buffer,
-                filename: download.suggestedFilename() || `${doc.type}.pdf`,
+                filename: download.suggestedFilename() || `doc_${doc.date}.pdf`,
               };
             }
           }
         } catch (e) {
-          console.log('Viewer download failed');
+          console.log('Download button failed');
         }
       }
 
-      // Step 6: Look for any PDF URLs on page
-      console.log('Step 6: Searching for PDF URLs...');
-      const pdfUrls = await viewerPage.evaluate(() => {
-        const urls: string[] = [];
-        document.querySelectorAll('a, iframe, object, embed').forEach(el => {
-          const url = el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('data');
-          if (url && (url.includes('.pdf') || url.includes('GetDocument') || url.includes('Download'))) {
-            urls.push(url);
-          }
-        });
-        return urls;
-      });
-
-      console.log(`Found ${pdfUrls.length} potential PDF URLs`);
-      
-      for (const pdfUrl of pdfUrls) {
-        try {
-          const fullUrl = pdfUrl.startsWith('http') ? pdfUrl : new URL(pdfUrl, viewerPage.url()).href;
-          console.log(`Trying: ${fullUrl}`);
-          const response = await viewerPage.request.get(fullUrl);
-          const buffer = await response.body();
-          
-          if (buffer.length > 500 && buffer[0] === 0x25) {
-            console.log(`SUCCESS! Got PDF from URL`);
-            if (viewerPage !== this.page) await viewerPage.close();
-            return {
-              ...doc,
-              pdfBuffer: buffer,
-              filename: `${doc.type.replace(/[^a-z0-9]/gi, '_')}.pdf`,
-            };
-          }
-        } catch (e) {
-          continue;
-        }
-      }
-
-      // Cleanup
-      if (viewerPage !== this.page) {
-        await viewerPage.close();
-      }
+      if (viewerPage !== this.page) await viewerPage.close();
       await this.page.keyboard.press('Escape');
-      await this.page.waitForTimeout(1000);
-
-      console.log('All download methods failed');
+      
+      console.log('Download failed');
       return null;
 
     } catch (error) {
-      console.error(`Download error: ${error}`);
+      console.error(`Error: ${error}`);
       return null;
     }
   }
