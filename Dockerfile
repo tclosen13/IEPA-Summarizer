@@ -42,6 +42,8 @@ COPY . .
 
 # Build the app
 ENV NEXT_TELEMETRY_DISABLED=1
+ARG OPENAI_API_KEY=dummy_key_for_build
+ENV OPENAI_API_KEY=$OPENAI_API_KEY
 RUN npm run build
 
 # Start the app
